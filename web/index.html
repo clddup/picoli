@@ -53,8 +53,8 @@
           <input id="strength" class="strength-range" type="range" min="0" max="100" value="50" step="1" aria-describedby="strength-hint">
           <div class="strength-labels"><span>更少改动</span><button id="reset-strength" class="text-button" type="button">默认 50</button><span>更小体积</span></div>
           <p id="strength-hint" class="setting-hint">数值越高，允许的失真越大。它不是画质保留百分比。</p>
-          <div class="memory-setting"><label for="memory">内存预算 <span>MEMORY</span></label><select id="memory" aria-describedby="memory-hint"><option value="128" selected>128 MiB · 默认</option><option value="256">256 MiB</option><option value="512">512 MiB</option><option value="1024">1024 MiB · 大图</option></select></div>
-          <p id="memory-hint" class="setting-hint" aria-live="polite">这是工作集估算预算，不是浏览器进程内存的硬上限。</p>
+          <div class="memory-setting"><label for="memory">内存预算 <span>MEMORY</span></label><select id="memory" aria-describedby="memory-hint"><option value="auto" selected>自动 · 推荐</option><option value="128">128 MiB</option><option value="256">256 MiB</option><option value="512">512 MiB</option><option value="1024">1024 MiB · 大图</option></select></div>
+          <p id="memory-hint" class="setting-hint" aria-live="polite">按图片自动选择所需预算，大图处理前会请求确认。</p>
         </div>
         <div id="file-list" class="file-list" aria-label="图片队列"></div>
         <div id="empty-queue" class="empty-queue"><span class="terminal-prompt" aria-hidden="true">›</span><p>等待添加图片<span class="terminal-cursor" aria-hidden="true">_</span></p><span class="empty-line" aria-hidden="true"></span></div>

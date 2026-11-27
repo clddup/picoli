@@ -107,7 +107,33 @@ pub fn decode_baseline(bytes: &[u8]) -> Result<Reference, Error> {
     decode_with_budget(bytes, resources::DEFAULT_MEMORY_BYTES)
 }
 
-pub fn decode_with_budget(bytes: &[u8], memory_budget_bytes: u64) -> Result<Reference, Error> {
+/// Estimate one compression worker's working set from validated headers only.
+///
+/// This does not decode pixels, build analysis, measure free RAM/browser RSS, or
+/// validate the complete entropy stream. Compression still validates the input.
+///
+/// # Errors
+/// Returns an error for unsupported/invalid headers, input over 32 MiB, or an
+/// estimate above the maximum automatic budget of 1024 MiB.
+pub fn compression_memory_plan(bytes: &[u8]) -> Result<resources::CompressionMemoryPlan, Error> {
+    let (decoder, jpeg_metadata, source_format) =
+        baseline_decoder(bytes, resources::MAX_AUTOMATIC_MEMORY_BYTES)
+            .map_err(resources::automatic_budget_error)?;
+    let (width, height) = decoder.dimensions();
+    resources::CompressionMemoryPlan::with_metadata(
+        width,
+        height,
+        source_format,
+        bytes.len(),
+        jpeg_metadata.len(),
+    )
+}
+
+// Shared header and display-metadata validation; never reads decoded pixels.
+fn baseline_decoder(
+    bytes: &[u8],
+    memory_budget_bytes: u64,
+) -> Result<(impl ImageDecoder + '_, JpegMetadata, &'static str), Error> {
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(Error::Limit("encoded input > 32 MiB"));
     }
@@ -171,8 +197,15 @@ pub fn decode_with_budget(bytes: &[u8], memory_budget_bytes: u64) -> Result<Refe
             "only 8-bit RGB/grayscale with optional alpha is supported",
         ));
     }
+    Ok((decoder, jpeg_metadata, source_format))
+}
+
+pub fn decode_with_budget(bytes: &[u8], memory_budget_bytes: u64) -> Result<Reference, Error> {
+    let (decoder, jpeg_metadata, source_format) = baseline_decoder(bytes, memory_budget_bytes)?;
+    let (width, height) = decoder.dimensions();
+    let max_side = (memory_budget_bytes / 56).min(u64::from(u32::MAX)) as u32;
     let mut alpha = None;
-    let pixels = if format == ImageFormat::Jpeg {
+    let pixels = if source_format == "jpeg" {
         // The project-local decoder patch tracks actual entropy consumption.
         // Strict mode rejects synthetic zero-fill used as coefficient data;
         // valid lookahead and JPEG end padding remain supported.
@@ -405,6 +438,131 @@ mod tests {
             jpeg_metadata: Default::default(),
         }
     }
+    fn png_chunk(bytes: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = bytes.len();
+        bytes.extend_from_slice(kind);
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(&crc32fast::hash(&bytes[start..]).to_be_bytes());
+    }
+
+    // Deliberately invalid image data: preflight must not inflate or decode it.
+    fn header_only_png(width: u32, height: u32, depth: u8) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[depth, 2, 0, 0, 0]);
+        png_chunk(&mut bytes, b"IHDR", &ihdr);
+        png_chunk(&mut bytes, b"IDAT", b"not a deflate stream");
+        png_chunk(&mut bytes, b"IEND", &[]);
+        bytes
+    }
+
+    #[test]
+    fn memory_preflight_reads_png_headers_not_pixels() {
+        for (width, height, tier) in [(1, 1, 128), (4464, 3173, 1024)] {
+            let bytes = header_only_png(width, height, 8);
+            let plan = compression_memory_plan(&bytes).unwrap();
+            assert_eq!(
+                (plan.width, plan.height, plan.format),
+                (width, height, "png")
+            );
+            assert_eq!(plan.memory_mib, tier);
+            let expected = resources::Plan::new(
+                width,
+                height,
+                bytes.len(),
+                resources::MAX_AUTOMATIC_MEMORY_BYTES,
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                plan.required_memory_bytes,
+                expected.estimated_shared_bytes + expected.estimated_worker_bytes
+            );
+        }
+        assert!(decode_baseline(&header_only_png(1, 1, 8)).is_err());
+    }
+
+    #[test]
+    fn memory_preflight_keeps_header_and_input_restrictions() {
+        assert!(compression_memory_plan(b"not an image").is_err());
+        assert!(compression_memory_plan(b"GIF89a").is_err());
+        assert!(matches!(
+            compression_memory_plan(&vec![0; MAX_INPUT_BYTES + 1]),
+            Err(Error::Limit(_))
+        ));
+        for (width, height, depth) in [(0, 1, 8), (1, 0, 8), (u32::MAX, u32::MAX, 8), (1, 1, 16)] {
+            assert!(compression_memory_plan(&header_only_png(width, height, depth)).is_err());
+        }
+        let excess = compression_memory_plan(&header_only_png(5000, 5000, 8)).unwrap_err();
+        assert!(matches!(excess, Error::Limit(_)));
+        let message = excess.to_string();
+        for expected in ["automatic", "budget", "1024"] {
+            assert!(message.contains(expected), "{message}");
+        }
+        let mut bad_crc = header_only_png(1, 1, 8);
+        bad_crc[29] ^= 1;
+        assert!(compression_memory_plan(&bad_crc).is_err());
+        assert!(compression_memory_plan(&bad_crc[..24]).is_err());
+        for kind in [b"acTL", b"eXIf", b"iCCP"] {
+            let mut bytes = header_only_png(1, 1, 8);
+            let iend = bytes.split_off(bytes.len() - 12);
+            png_chunk(&mut bytes, kind, &[]);
+            bytes.extend_from_slice(&iend);
+            assert!(matches!(
+                compression_memory_plan(&bytes),
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn memory_preflight_reads_jpeg_headers_not_entropy() {
+        let mut bytes = encode_jpeg_baseline(&reference(), 60).unwrap();
+        let sos = bytes.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+        let length = usize::from(u16::from_be_bytes([bytes[sos + 2], bytes[sos + 3]]));
+        bytes.truncate(sos + 2 + length);
+        bytes.extend_from_slice(&[0xff, 0xd9]);
+        assert_eq!(compression_memory_plan(&bytes).unwrap().format, "jpeg");
+        assert!(decode_baseline(&bytes).is_err());
+        bytes.truncate(bytes.len() - 2);
+        assert!(compression_memory_plan(&bytes).is_err());
+    }
+
+    #[test]
+    fn memory_preflight_includes_retained_jpeg_metadata() {
+        let plain = encode_jpeg_baseline(&reference(), 60).unwrap();
+        let payload = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x01\0\0\0\0\0\0\0";
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
+        bytes.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(&plain[2..]);
+        let plan = compression_memory_plan(&bytes).unwrap();
+        assert_eq!((plan.width, plan.height, plan.format), (16, 12, "jpeg"));
+        assert_eq!(plan.memory_mib, 128);
+        let expected = resources::Plan::with_metadata(
+            16,
+            12,
+            bytes.len(),
+            payload.len() + 4,
+            resources::MAX_AUTOMATIC_MEMORY_BYTES,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.required_memory_bytes,
+            expected.estimated_shared_bytes + expected.estimated_worker_bytes
+        );
+        // The retained EXIF parser must still reject rotation in preflight.
+        bytes[6 + 24] = 6;
+        assert!(matches!(
+            compression_memory_plan(&bytes),
+            Err(Error::Unsupported(_))
+        ));
+    }
+
     #[test]
     fn lossless_png_roundtrip_is_pixel_exact() {
         let source = reference();

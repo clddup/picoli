@@ -6,6 +6,64 @@ use serde::Serialize;
 /// supplies its OS-derived budget; a WASM host can supply a larger tested budget.
 pub const DEFAULT_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Automatic admission is capped, not a measurement of available physical RAM.
+pub const MAX_AUTOMATIC_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
+
+pub(crate) fn automatic_budget_error(error: Error) -> Error {
+    match error {
+        Error::Limit("estimated decode/analysis/search memory exceeds host budget") => {
+            Error::Limit("estimated memory exceeds automatic budget of 1024 MiB")
+        }
+        other => other,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CompressionMemoryPlan {
+    pub width: u32,
+    pub height: u32,
+    pub format: &'static str,
+    pub required_memory_bytes: u64,
+    pub memory_mib: u32,
+}
+
+impl CompressionMemoryPlan {
+    pub(crate) fn with_metadata(
+        width: u32,
+        height: u32,
+        format: &'static str,
+        input_bytes: usize,
+        metadata_bytes: usize,
+    ) -> Result<Self, Error> {
+        let plan = Plan::with_metadata(
+            width,
+            height,
+            input_bytes,
+            metadata_bytes,
+            MAX_AUTOMATIC_MEMORY_BYTES,
+            1,
+        )
+        .map_err(automatic_budget_error)?;
+        let required_memory_bytes = plan
+            .estimated_shared_bytes
+            .checked_add(plan.estimated_worker_bytes)
+            .ok_or(Error::Limit("working-set estimate overflow"))?;
+        let memory_mib = [128u32, 256, 512, 1024]
+            .into_iter()
+            .find(|&mib| required_memory_bytes <= u64::from(mib) * 1024 * 1024)
+            .ok_or(Error::Limit(
+                "estimated memory exceeds automatic budget of 1024 MiB",
+            ))?;
+        Ok(Self {
+            width,
+            height,
+            format,
+            required_memory_bytes,
+            memory_mib,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Plan {
     pub memory_budget_bytes: u64,
@@ -77,6 +135,71 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_plan_uses_smallest_tier_and_keeps_default_128() {
+        assert_eq!(DEFAULT_MEMORY_BYTES, 128 * 1024 * 1024);
+        assert_eq!(
+            CompressionMemoryPlan::with_metadata(1, 1, "png", 100, 0)
+                .unwrap()
+                .memory_mib,
+            128
+        );
+        for (width, tier) in [(2000, 128u32), (4000, 256), (9000, 512), (19000, 1024)] {
+            let base = Plan::new(width, 1000, 0, MAX_AUTOMATIC_MEMORY_BYTES, 1).unwrap();
+            let input_bytes = ((u64::from(tier) * 1024 * 1024
+                - base.estimated_shared_bytes
+                - base.estimated_worker_bytes)
+                / 2) as usize;
+            let plan =
+                CompressionMemoryPlan::with_metadata(width, 1000, "png", input_bytes, 0).unwrap();
+            assert_eq!(plan.memory_mib, tier);
+            assert_eq!(plan.required_memory_bytes, u64::from(tier) * 1024 * 1024);
+            let above =
+                CompressionMemoryPlan::with_metadata(width, 1000, "png", input_bytes + 1, 0);
+            if tier == 1024 {
+                assert!(matches!(above, Err(Error::Limit(_))));
+            } else {
+                assert_eq!(above.unwrap().memory_mib, tier * 2);
+            }
+        }
+    }
+
+    #[test]
+    fn automatic_plan_covers_real_14mp_input_and_retained_metadata() {
+        let plan = CompressionMemoryPlan::with_metadata(4464, 3173, "png", 6_212_113, 0).unwrap();
+        assert_eq!(plan.required_memory_bytes, 809_817_762);
+        assert_eq!(plan.memory_mib, 1024);
+        let metadata =
+            CompressionMemoryPlan::with_metadata(1000, 1000, "jpeg", 1000, 1024).unwrap();
+        let expected =
+            Plan::with_metadata(1000, 1000, 1000, 1024, MAX_AUTOMATIC_MEMORY_BYTES, 1).unwrap();
+        assert_eq!(
+            metadata.required_memory_bytes,
+            expected.estimated_shared_bytes + expected.estimated_worker_bytes
+        );
+    }
+
+    #[test]
+    fn automatic_plan_rejects_zero_overflow_and_excess() {
+        for (width, height) in [(0, 1), (1, 0)] {
+            assert!(matches!(
+                CompressionMemoryPlan::with_metadata(width, height, "png", 0, 0),
+                Err(Error::Argument(_))
+            ));
+        }
+        for (width, height, input, metadata) in [
+            (u32::MAX, u32::MAX, 0, 0),
+            (5000, 5000, 0, 0),
+            (1, 1, usize::MAX, 0),
+            (1, 1, 0, usize::MAX),
+        ] {
+            assert!(matches!(
+                CompressionMemoryPlan::with_metadata(width, height, "png", input, metadata),
+                Err(Error::Limit(_))
+            ));
+        }
+    }
+
     #[test]
     fn concurrency_adapts_without_a_fixed_pixel_cutoff() {
         assert_eq!(

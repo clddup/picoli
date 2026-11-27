@@ -13,6 +13,16 @@ pub fn baseline_encode(input: &[u8], format: &str, quality: u8) -> Result<Vec<u8
     result.map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Header-only one-worker budget estimate, capped at 1024 MiB; not free RAM/RSS.
+/// The returned JSON has width, height, format, required_memory_bytes and memory_mib.
+/// Actual compression still validates the complete image.
+#[wasm_bindgen]
+pub fn compression_memory_plan(input: &[u8]) -> Result<String, JsValue> {
+    let plan = picoli_core::compression_memory_plan(input)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_json::to_string(&plan).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 /// Optional compression strength percentage; input format and dimensions stay unchanged.
 /// Proxy error limits are experimental and do not prove perceptual equivalence.
 #[wasm_bindgen]

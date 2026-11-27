@@ -80,6 +80,6 @@ test('empty or larger-than-input results cannot be presented as success', async 
 
 test('hung engine times out and releases worker', async () => {
   const worker = new WorkerHarness();
-  await assert.rejects(compressFile(file, 50, { workerFactory: () => worker, timeout: 5 }), /超过 3 分钟/);
+  await assert.rejects(compressFile(file, 50, { workerFactory: () => worker, timeout: 5 }), /加载超时/);
   assert.equal(worker.stopped, true);
 });

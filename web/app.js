@@ -66,7 +66,7 @@ function render() {
   const saved = done.reduce((sum, item) => sum + item.file.size - item.blob.size, 0);
   const active = items.find(item => item.status === 'running');
   $('queue-summary').textContent = active
-    ? `${active.phase === 'loading' ? '加载压缩器' : '正在处理'} · ${active.file.name}`
+    ? `${({ loading: '加载压缩器', planning: '自动估算内存', 'awaiting-memory': '等待大图确认', 'long-running': '处理较久，仍在等待结果，可随时停止' })[active.phase] || '正在处理'} · ${active.file.name}`
     : running ? '正在准备下一张…'
     : done.length ? `已完成 ${done.length} 张${items.some(item => item.status === 'error') ? ` · ${items.filter(item => item.status === 'error').length} 张未完成` : ''} · 共减少 ${formatBytes(saved)}`
     : items.some(item => item.status === 'error') ? `${items.filter(item => item.status === 'error').length} 张未完成，可移除或重试`
@@ -155,7 +155,7 @@ function renderPreview() {
   $('result-info').title = item.error || '';
   if (item.blob) {
     const saving = savingsPercent(item.file.size, item.blob.size);
-    $('result-info').replaceChildren(element('strong', '', saving > 0 ? `体积减少 ${saving.toFixed(1)}%` : '体积未减少'), element('span', '', `强度 ${item.usedStrength} · ${formatDuration(item.milliseconds)}`));
+    $('result-info').replaceChildren(element('strong', '', saving > 0 ? `体积减少 ${saving.toFixed(1)}%` : '体积未减少'), element('span', '', `强度 ${item.usedStrength} · ${formatDuration(item.milliseconds)}${item.usedMemorySetting === 'auto' ? ` · 自动预算 ${item.usedMemoryMiB} MiB` : ''}`));
   } else {
     $('result-info').textContent = item.error ? readableError(item.error) : (item.status === 'running' ? '正在本地处理，页面可以继续操作。' : '压缩后可拖动分界，查看差异。');
     $('result-info').title = item.error || '';
@@ -208,8 +208,9 @@ async function addFiles(files) {
 async function start() {
   if (running) { stopRequested = true; currentAbort?.abort(); return; }
   const strength = Number($('strength').value);
-  const memoryMiB = Number($('memory').value);
-  let pending = items.filter(item => item.format && (item.status !== 'done' || item.usedStrength !== strength || item.usedMemoryMiB !== memoryMiB));
+  const memoryMiB = $('memory').value === 'auto' ? 'auto' : Number($('memory').value);
+  let approvedHighMemory = false;
+  let pending = items.filter(item => item.format && (item.status !== 'done' || item.usedStrength !== strength || item.usedMemorySetting !== memoryMiB));
   if (!pending.length) pending = items.filter(item => item.format);
   if (!pending.length) return;
   const token = ++runToken;
@@ -227,11 +228,19 @@ async function start() {
         const result = await compressFile(item.file, strength, {
           signal: currentAbort.signal, memoryMiB,
           onPhase: phase => { if (token === runToken && items.includes(item)) { item.phase = phase; render(); } },
+          onMemoryApproval: plan => {
+            if (token !== runToken || stopRequested || !items.includes(item)) return false;
+            if (!approvedHighMemory) {
+              approvedHighMemory = window.confirm(`这张图片需要较多内存，已自动选择 ${plan.memory_mib} MiB 预算。\n\n继续后，本批次会按需自动选择最高 1024 MiB 预算，不会同时处理多张。预算不等于实际占用，也不保证设备内存充足；手机或内存紧张时，页面可能被系统关闭。\n\n是否继续处理？`);
+            }
+            return approvedHighMemory;
+          },
         });
         if (token !== runToken || !items.includes(item)) break;
         item.blob = new Blob([result.buffer], { type: item.mime });
         item.resultUrl = URL.createObjectURL(item.blob);
-        item.milliseconds = result.milliseconds; item.usedStrength = strength; item.usedMemoryMiB = memoryMiB;
+        item.milliseconds = result.milliseconds; item.usedStrength = strength;
+        item.usedMemorySetting = memoryMiB; item.usedMemoryMiB = result.memoryMiB;
         item.status = 'done';
       } catch (error) {
         if (token !== runToken || !items.includes(item)) break;
@@ -269,8 +278,9 @@ $('strength').addEventListener('input', syncStrength);
 $('memory').addEventListener('change', () => {
   const high = Number($('memory').value) >= 512;
   $('memory-hint').classList.toggle('warning', high);
-  $('memory-hint').textContent = high
-    ? '高预算会增加内存占用，手机或内存不足的设备慎用。预算不是进程内存的硬上限。'
+  $('memory-hint').textContent = $('memory').value === 'auto'
+    ? '按图片自动选择所需预算，大图处理前会请求确认。'
+    : high ? '高预算会增加内存占用，手机或内存不足的设备慎用。预算不是进程内存的硬上限。'
     : '这是工作集估算预算，不是浏览器进程内存的硬上限。';
 });
 $('reset-strength').addEventListener('click', () => { $('strength').value = '50'; syncStrength(); });

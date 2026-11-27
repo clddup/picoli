@@ -218,13 +218,43 @@ pub(crate) fn candidate(
     sampling: u16,
     scale: u16,
 ) -> Result<Candidate, Error> {
+    candidate_impl(reference, analysis, shape, sampling, scale, None)?
+        .ok_or_else(|| Error::Encoding("unbounded JPEG candidate unexpectedly rejected".into()))
+}
+
+pub(crate) fn candidate_bounded(
+    reference: &Reference,
+    analysis: &Analysis,
+    shape: Shape,
+    sampling: u16,
+    scale: u16,
+    limits: crate::quality::Limits,
+) -> Result<Option<Candidate>, Error> {
+    candidate_impl(reference, analysis, shape, sampling, scale, Some(limits))
+}
+
+fn candidate_impl(
+    reference: &Reference,
+    analysis: &Analysis,
+    shape: Shape,
+    sampling: u16,
+    scale: u16,
+    limits: Option<crate::quality::Limits>,
+) -> Result<Option<Candidate>, Error> {
     let data = encode(reference, analysis, shape, sampling, scale)?;
     let reconstructed = crate::decode_with_budget(&data, analysis.memory_budget_bytes)?;
-    Ok(Candidate {
+    let score = match limits {
+        Some(limits) => analysis.score_with_limits(&reconstructed.pixels, limits)?,
+        None => Some(analysis.score(&reconstructed.pixels)?),
+    };
+    let Some(score) = score else {
+        return Ok(None);
+    };
+    Ok(Some(Candidate {
         id: format!("jpeg-{shape:?}-{sampling}-scale{scale}"),
         bytes: data.len(),
         data,
-        score: analysis.score(&reconstructed.pixels)?,
+        score,
         parameters: Parameters::Jpeg {
             shape,
             sampling,
@@ -236,7 +266,7 @@ pub(crate) fn candidate(
             quantization_margin_percent: 100,
             coefficient_rdo_sampling_weights: false,
         },
-    })
+    }))
 }
 
 pub(crate) fn search(

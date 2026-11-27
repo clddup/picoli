@@ -36,6 +36,7 @@ codegen-units = 1
 
 [profile.wasm-release]
 inherits = "release"
-opt-level = "s"
+# Favor compression runtime over download size for the CPU-heavy search/scoring loops.
+opt-level = 3
 lto = true
 strip = true

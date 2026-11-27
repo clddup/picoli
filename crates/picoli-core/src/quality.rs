@@ -102,8 +102,8 @@ pub fn run_job(
     }
     let limits = strength.limits();
     match job {
-        Job::Jpeg { shape, sampling } => crate::jpeg_search::run(strength, |scale| {
-            jpeg::candidate(reference, analysis, shape, sampling, scale)
+        Job::Jpeg { shape, sampling } => crate::jpeg_search::run_bounded(strength, |scale| {
+            jpeg::candidate_bounded(reference, analysis, shape, sampling, scale, limits)
         }),
         Job::PngPredictive => {
             let mut result: Option<Candidate> = None;

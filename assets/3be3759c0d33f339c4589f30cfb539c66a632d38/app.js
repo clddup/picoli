@@ -1,5 +1,5 @@
 import { inspectFile, formatBytes, formatDuration, savingsPercent, outputName, readableError } from './files.js';
-import { compressFile } from './engine-client.js';
+import { compressBatch } from './engine-client.js';
 import { createZip, downloadBlob } from './download.js';
 
 const $ = id => document.getElementById(id);
@@ -63,10 +63,19 @@ function render() {
   $('download-all').textContent = packaging ? '打包中…' : '下载 ZIP';
   const done = items.filter(item => item.status === 'done');
   const saved = done.reduce((sum, item) => sum + item.file.size - item.blob.size, 0);
-  const active = items.find(item => item.status === 'running');
-  $('queue-summary').textContent = active
-    ? `${({ loading: '加载压缩器', 'long-running': '大图耗时较长，仍在处理中，可随时停止' })[active.phase] || '正在处理'} · ${active.file.name}`
-    : running ? '正在准备下一张…'
+  const active = items.filter(item => item.status === 'running');
+  const formatActiveSummary = () => {
+    if (active.length === 1) {
+      const current = active[0];
+      return `${({ loading: '加载压缩器', 'long-running': '大图耗时较长，仍在处理中，可随时停止' })[current.phase] || '正在处理'} · ${current.file.name}`;
+    }
+    const slow = active.some(item => item.phase === 'long-running');
+    const finished = items.filter(item => item.status === 'done' || item.status === 'error').length;
+    return `正在并行处理 ${active.length} 张 · 已完成 ${finished}/${items.length}${slow ? ' · 大图耗时较长，可随时停止' : ''}`;
+  };
+  $('queue-summary').textContent = active.length
+    ? formatActiveSummary()
+    : running ? '正在准备队列…'
     : done.length ? `已完成 ${done.length} 张${items.some(item => item.status === 'error') ? ` · ${items.filter(item => item.status === 'error').length} 张未完成` : ''} · 共减少 ${formatBytes(saved)}`
     : items.some(item => item.status === 'error') ? `${items.filter(item => item.status === 'error').length} 张未完成，可移除或重试`
     : items.some(item => item.status === 'cancelled') ? '已停止，可继续处理或清空队列'
@@ -212,33 +221,45 @@ async function start() {
   if (!pending.length) return;
   const token = ++runToken;
   stopRequested = false; running = true;
+  currentAbort = new AbortController();
+  for (const item of pending) {
+    if (item.resultUrl) URL.revokeObjectURL(item.resultUrl);
+    item.blob = null; item.resultUrl = null; item.error = '';
+    item.status = 'ready'; item.phase = '';
+  }
   render();
   try {
-    for (const item of pending) {
-      if (token !== runToken || stopRequested) break;
-      if (!items.includes(item)) continue;
-      if (item.resultUrl) URL.revokeObjectURL(item.resultUrl);
-      item.blob = null; item.resultUrl = null; item.error = '';
-      item.status = 'running'; item.phase = 'loading';
-      currentAbort = new AbortController(); render();
-      try {
-        const result = await compressFile(item.file, strength, {
-          signal: currentAbort.signal,
-          onPhase: phase => { if (token === runToken && items.includes(item)) { item.phase = phase; render(); } },
-        });
-        if (token !== runToken || !items.includes(item)) break;
+    await compressBatch(pending, strength, {
+      signal: currentAbort.signal,
+      onStart: item => {
+        if (token !== runToken || !items.includes(item)) return;
+        item.status = 'running';
+        item.phase = 'loading';
+        render();
+      },
+      onPhase: (item, phase) => {
+        if (token !== runToken || !items.includes(item)) return;
+        item.phase = phase;
+        render();
+      },
+      onResult: (item, result) => {
+        if (token !== runToken || !items.includes(item)) return;
         item.blob = new Blob([result.buffer], { type: item.mime });
         item.resultUrl = URL.createObjectURL(item.blob);
-        item.milliseconds = result.milliseconds; item.usedStrength = strength;
+        item.milliseconds = result.milliseconds;
+        item.usedStrength = strength;
         item.status = 'done';
-      } catch (error) {
-        if (token !== runToken || !items.includes(item)) break;
+        render();
+      },
+      onError: (item, error) => {
+        if (token !== runToken || !items.includes(item)) return;
         item.status = error.name === 'AbortError' ? 'cancelled' : 'error';
         item.error = error.name === 'AbortError' ? '' : error.message;
-        if (error.name === 'AbortError') break;
-      }
-      render();
-    }
+        render();
+      },
+    });
+  } catch (error) {
+    if (error.name !== 'AbortError' && token === runToken) toast(error.message);
   } finally {
     if (token === runToken) { running = false; currentAbort = null; render(); }
   }

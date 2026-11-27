@@ -1,15 +1,31 @@
 import init, { compress_experimental } from './pkg/picoli_wasm.js';
 
+let initialized = false;
+let initPromise = null;
 let busy = false;
 
-// Every compression gets a fresh worker, so terminating it releases the WASM heap.
+async function ensureInit() {
+  if (initialized) return;
+  if (!initPromise) {
+    initPromise = init().then(() => { initialized = true; }).catch(error => {
+      initPromise = null;
+      throw error;
+    });
+  }
+  await initPromise;
+}
+
+// Reuses the compiled WASM instance across small/medium files; callers
+// terminate the worker after large images or batch completion to reclaim heap.
 self.onmessage = async ({ data }) => {
   if (busy || data?.type !== 'compress' || !(data.input instanceof ArrayBuffer)) return;
   busy = true;
   try {
     const start = performance.now();
-    self.postMessage({ type: 'phase', phase: 'loading' });
-    await init();
+    if (!initialized) {
+      self.postMessage({ type: 'phase', phase: 'loading' });
+      await ensureInit();
+    }
     const input = new Uint8Array(data.input);
     self.postMessage({ type: 'phase', phase: 'compressing' });
     // Omit memoryMiB to adapt automatically to each image inside the Rust core.
@@ -21,5 +37,7 @@ self.onmessage = async ({ data }) => {
     self.postMessage({ type: 'result', buffer, milliseconds: performance.now() - start }, [buffer]);
   } catch (error) {
     self.postMessage({ type: 'error', message: error instanceof Error ? error.message : String(error) });
+  } finally {
+    busy = false;
   }
 };

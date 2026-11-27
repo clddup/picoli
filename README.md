@@ -80,10 +80,16 @@ cargo test --workspace
 - `crates/picoli-wasm`：WebAssembly 接口。
 - `vendor`：带本地补丁的第三方依赖及其许可证。
 
-PNG 和 JPEG 编码复用现有库，PNG 无损重压缩使用 libdeflate。
+## 许可证与第三方代码
 
-## 许可证
+Picoli 采用 [GNU GPL v3.0](LICENSE)（`GPL-3.0-only`）。
 
-Picoli 采用 [GNU GPL v3.0](LICENSE)（`GPL-3.0-only`）。第三方依赖保留各自的许可证，详见 `vendor` 中的许可文件和修改说明。
+本项目直接包含以下开源项目的源码，并进行了本地修改：
 
-This software is based in part on the work of the Independent JPEG Group.
+- [jpeg-encoder](https://github.com/vstroebel/jpeg-encoder)：JPEG 编码，许可证为 `(MIT OR Apache-2.0) AND IJG`。
+- [zune-jpeg](https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg)：JPEG 解码，许可证为 `MIT OR Apache-2.0 OR Zlib`。
+- [libdeflater](https://github.com/libdeflater/libdeflater)：libdeflate 的 Rust 包装，许可证为 `Apache-2.0`。
+
+PNG 编码与 DEFLATE 压缩还使用 `png`、`miniz_oxide` 和 C 库 `libdeflate`。这些底层编解码实现来自上游；Picoli 在此基础上增加图片分析、量化与候选搜索、误差约束和结果选择。
+
+第三方代码保留各自的许可证。来源、版本、本地修改和 IJG 致谢见 [第三方代码与许可说明](THIRD-PARTY-NOTICES.md)。

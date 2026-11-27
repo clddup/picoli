@@ -33,29 +33,20 @@ struct Alternative {
     luma_table: Vec<u16>,
     rewritten: Vec<usize>,
 }
-fn encode_solution(
+fn encode_solution_from_frame(
     reference: &Reference,
     analysis: &Analysis,
-    current: &Candidate,
+    mut frame: zune_jpeg::QuantizedCoefficients,
     model: &model::Model,
     solution: &solver::Solution,
     admission: &Admission,
     coding: Coding,
 ) -> Result<Option<Alternative>, Error> {
-    let sampling = generated_sampling(&current.parameters)?;
-    let Captured { mut frame, pixels } = coefficient_io::capture_generated(
-        &current.data,
-        reference,
-        sampling,
-        admission.coefficients,
-    )?;
-    drop(pixels);
     model::apply(model, solution, &mut frame)?;
     let luma_table = frame.components[0].quantization_table.to_vec();
     let data =
         coefficient_io::serialize_bounded(reference, &frame, coding, admission.output_limit)?;
-    // The original capture/model frame is already gone. Release this encoder
-    // frame too, before metadata/ICC validation and the unrelated output decode.
+    // Release this encoder frame before metadata/ICC validation and output decode.
     drop(frame);
     let Some(data) = data else {
         return Ok(None);
@@ -84,6 +75,28 @@ fn encode_solution(
         luma_table,
         rewritten,
     }))
+}
+
+fn encode_solution(
+    reference: &Reference,
+    analysis: &Analysis,
+    current: &Candidate,
+    model: &model::Model,
+    solution: &solver::Solution,
+    admission: &Admission,
+    coding: Coding,
+) -> Result<Option<Alternative>, Error> {
+    let sampling = generated_sampling(&current.parameters)?;
+    let Captured { frame, pixels } = coefficient_io::capture_generated(
+        &current.data,
+        reference,
+        sampling,
+        admission.coefficients,
+    )?;
+    drop(pixels);
+    encode_solution_from_frame(
+        reference, analysis, frame, model, solution, admission, coding,
+    )
 }
 
 fn generated_sampling(parameters: &Parameters) -> Result<u16, Error> {
@@ -184,7 +197,6 @@ fn refine_original(
         coding.scans,
         admission.histogram_entries,
     )?;
-    drop(frame);
     drop(pixels);
     let Some(model) = model else {
         return Ok(false);
@@ -206,11 +218,17 @@ fn refine_original(
             ));
         }
     }
-    let plain = encode_solution(
-        reference, analysis, current, &model, &single, &admission, coding,
+    let plain = encode_solution_from_frame(
+        reference,
+        analysis,
+        frame.clone(),
+        &model,
+        &single,
+        &admission,
+        coding,
     )?;
-    let raw = encode_solution(
-        reference, analysis, current, &model, &paired, &admission, coding,
+    let raw = encode_solution_from_frame(
+        reference, analysis, frame, &model, &paired, &admission, coding,
     )?;
     let accepted = |a: &Alternative| {
         a.data.len() < current.data.len() && nonworse(&a.score, &control_score, strength)

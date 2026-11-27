@@ -11,7 +11,7 @@
 mod chroma_renderer;
 pub use chroma_renderer::ChromaRenderer;
 mod renderer;
-pub use renderer::{LumaRenderer, stream_reconstruct_progressive};
+pub use renderer::{LumaRenderer, StreamReconstructor, stream_reconstruct_progressive};
 
 use alloc::vec::Vec;
 use zune_core::bytestream::ZByteReaderTrait;

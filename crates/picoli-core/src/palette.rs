@@ -18,36 +18,62 @@ fn key(rgb: [u8; 3]) -> usize {
         | (usize::from(rgb[2]) >> 3)
 }
 
-fn histogram(reference: &Reference, analysis: &Analysis) -> Vec<Bin> {
-    let mut buckets = vec![[0u64; 4]; 32768];
-    for (i, (pixel, &weight)) in reference.pixels.pixels().zip(&analysis.weights).enumerate() {
-        let weight = u64::from(weight)
-            * reference
-                .alpha
-                .as_ref()
-                .map_or(1, |a| u64::from(a.as_raw()[i]));
-        let bucket = &mut buckets[key(pixel.0)];
-        bucket[3] += weight;
-        for c in 0..3 {
-            bucket[c] += u64::from(pixel[c]) * weight;
+pub(crate) struct Histogram {
+    bins: Vec<Bin>,
+    seen: Vec<u16>,
+    cache_has_reuse: bool,
+}
+
+impl Histogram {
+    pub(crate) fn new(reference: &Reference, analysis: &Analysis) -> Self {
+        let mut buckets = vec![[0u64; 4]; 32768];
+        let mut seen = Vec::new();
+        let mut visited = vec![false; 32768];
+        let raw = reference.pixels.as_raw();
+        let alpha = reference.alpha.as_ref().map(|a| a.as_raw().as_slice());
+        for (i, &w) in analysis.weights.iter().enumerate() {
+            let px = i * 3;
+            let rgb = [raw[px], raw[px + 1], raw[px + 2]];
+            let k = key(rgb);
+            if !visited[k] {
+                visited[k] = true;
+                seen.push(k as u16);
+            }
+            let weight = u64::from(w) * alpha.map_or(1, |a| u64::from(a[i]));
+            let bucket = &mut buckets[k];
+            bucket[3] += weight;
+            bucket[0] += u64::from(rgb[0]) * weight;
+            bucket[1] += u64::from(rgb[1]) * weight;
+            bucket[2] += u64::from(rgb[2]) * weight;
+        }
+        let bins = buckets
+            .into_iter()
+            .filter(|b| b[3] != 0)
+            .map(|b| {
+                let rgb = std::array::from_fn(|c| ((b[c] + b[3] / 2) / b[3]) as u8);
+                Bin {
+                    rgb,
+                    value: color(rgb),
+                    weight: b[3],
+                }
+            })
+            .collect();
+        let cache_has_reuse = reference.alpha.is_none() && cache_has_reuse(reference);
+        Self {
+            bins,
+            seen,
+            cache_has_reuse,
         }
     }
-    buckets
-        .into_iter()
-        .filter(|b| b[3] != 0)
-        .map(|b| {
-            let rgb = std::array::from_fn(|c| ((b[c] + b[3] / 2) / b[3]) as u8);
-            Bin {
-                rgb,
-                value: color(rgb),
-                weight: b[3],
-            }
-        })
-        .collect()
 }
 
 pub(crate) fn train(reference: &Reference, analysis: &Analysis, count: usize) -> Vec<[u8; 3]> {
-    let bins = histogram(reference, analysis);
+    let hist = Histogram::new(reference, analysis);
+    train_from_histogram(&hist, count)
+}
+
+pub(crate) fn train_from_histogram(hist: &Histogram, count: usize) -> Vec<[u8; 3]> {
+    let bins = &hist.bins;
     if bins.is_empty() {
         return vec![[0, 0, 0]];
     }
@@ -80,7 +106,7 @@ pub(crate) fn train(reference: &Reference, analysis: &Analysis, count: usize) ->
     for _ in 0..5 {
         let values: Vec<_> = palette.iter().copied().map(color).collect();
         let mut sums = vec![[0u64; 4]; palette.len()];
-        for bin in &bins {
+        for bin in bins {
             let chosen = values
                 .iter()
                 .enumerate()
@@ -116,6 +142,9 @@ pub(crate) struct Mapper<'a> {
     palette: &'a [[u8; 3]],
     values: Vec<[i32; 3]>,
     masks: Vec<[u64; 4]>,
+    // For non-exact mode (`cell_two_nearest`), each cell has at most two
+    // candidates; storing them directly avoids 256-bit mask loops.
+    two_nearest: Vec<[u8; 2]>,
     // Direct-mapped, bounded cache of exact RGB nearest colors. Transparent
     // inputs keep the original all-candidate path to preserve alpha-rounding ties.
     nearest_cache: Vec<(u32, u8)>,
@@ -138,16 +167,48 @@ fn cache_has_reuse(reference: &Reference) -> bool {
 
 impl<'a> Mapper<'a> {
     pub(crate) fn new(reference: &Reference, palette: &'a [[u8; 3]], exact: bool) -> Self {
-        let values: Vec<_> = palette.iter().copied().map(color).collect();
-        let mut masks = vec![[0u64; 4]; 32768];
-        let mut seen = vec![false; 32768];
+        let mut seen = Vec::new();
+        let mut visited = vec![false; 32768];
         for pixel in reference.pixels.pixels() {
             let k = key(pixel.0);
-            if seen[k] {
-                continue;
+            if !visited[k] {
+                visited[k] = true;
+                seen.push(k as u16);
             }
-            seen[k] = true;
-            let low = pixel.0.map(|c| i32::from(c & !7));
+        }
+        let reuse = exact && reference.alpha.is_none() && cache_has_reuse(reference);
+        Self::from_seen(&seen, palette, exact, reuse)
+    }
+
+    pub(crate) fn with_histogram(
+        reference: &Reference,
+        hist: &Histogram,
+        palette: &'a [[u8; 3]],
+        exact: bool,
+    ) -> Self {
+        let reuse = exact && reference.alpha.is_none() && hist.cache_has_reuse;
+        Self::from_seen(&hist.seen, palette, exact, reuse)
+    }
+
+    fn from_seen(seen: &[u16], palette: &'a [[u8; 3]], exact: bool, reuse: bool) -> Self {
+        let values: Vec<_> = palette.iter().copied().map(color).collect();
+        let mut masks = if exact {
+            vec![[0u64; 4]; 32768]
+        } else {
+            Vec::new()
+        };
+        let mut two_nearest = if exact {
+            Vec::new()
+        } else {
+            vec![[0u8; 2]; 32768]
+        };
+        for &k16 in seen {
+            let k = usize::from(k16);
+            let low = [
+                ((k >> 10) & 31) as i32 * 8,
+                ((k >> 5) & 31) as i32 * 8,
+                (k & 31) as i32 * 8,
+            ];
             if exact {
                 // An RGB cube maps into this enclosing [2Y, Co, Cg] box.
                 // A color whose minimum distance exceeds another color's
@@ -201,16 +262,15 @@ impl<'a> Mapper<'a> {
                         best[1] = entry;
                     }
                 }
-                for (_, index) in best {
-                    masks[k][index / 64] |= 1 << (index % 64);
-                }
+                two_nearest[k] = [best[0].1 as u8, best[1].1 as u8];
             }
         }
         Self {
             palette,
             values,
             masks,
-            nearest_cache: if exact && reference.alpha.is_none() && cache_has_reuse(reference) {
+            two_nearest,
+            nearest_cache: if reuse {
                 vec![(u32::MAX, 0); 65536]
             } else {
                 Vec::new()
@@ -277,14 +337,109 @@ impl<'a> Mapper<'a> {
     ) -> Option<(Vec<u8>, crate::analysis::Score)> {
         debug_assert!(reference.alpha.is_none());
         let mut scorer = context.start();
-        let (indices, _) = self.map_impl(
-            reference,
-            analysis,
-            coherence,
-            nearest_indices,
-            false,
-            |i, value| scorer.push(i, value),
-        )?;
+        if let Some(nearest) = nearest_indices {
+            // Fast 3-candidate path for opaque coherence > 0: the winner among
+            // (mask_i U {left, up}) can only be nearest[i], left, or up.
+            let width = reference.pixels.width() as usize;
+            let height = reference.pixels.height() as usize;
+            let len = analysis.colors.len();
+            let mut indices = Vec::with_capacity((width * 16).min(len));
+            let coh = u64::from(coherence);
+            let values = &self.values;
+            let weights = &analysis.weights;
+            let mut i = 0usize;
+            for y in 0..height {
+                let has_up = y > 0;
+                for x in 0..width {
+                    let has_left = x > 0;
+                    let n = nearest[i];
+                    let left = if has_left { indices[i - 1] } else { n };
+                    let up = if has_up { indices[i - width] } else { n };
+                    let chosen = if n == left && n == up {
+                        n
+                    } else {
+                        let w = u64::from(weights[i]);
+                        let orig = analysis.colors.at(i);
+                        let t_n = u64::from(has_left && n != left) + u64::from(has_up && n != up);
+                        let mut best = (distance(values[usize::from(n)], orig) * w + coh * t_n, n);
+                        if has_left && left != n {
+                            let t_l = u64::from(has_up && left != up);
+                            best = best.min((
+                                distance(values[usize::from(left)], orig) * w + coh * t_l,
+                                left,
+                            ));
+                        }
+                        if has_up && up != n && (!has_left || up != left) {
+                            let t_u = u64::from(has_left);
+                            best = best
+                                .min((distance(values[usize::from(up)], orig) * w + coh * t_u, up));
+                        }
+                        best.1
+                    };
+                    indices.push(chosen);
+                    if !scorer.push(i, values[usize::from(chosen)]) {
+                        return None;
+                    }
+                    i += 1;
+                }
+            }
+            return Some((indices, scorer.finish()));
+        }
+        if !self.two_nearest.is_empty() {
+            // Fast 4-candidate path for opaque non-exact mode (`cell_two_nearest`):
+            // exact candidate set is `{c0, c1} U {left, up}`, matching bitmask order.
+            let width = reference.pixels.width() as usize;
+            let height = reference.pixels.height() as usize;
+            let len = analysis.colors.len();
+            let mut indices = Vec::with_capacity((width * 16).min(len));
+            let coh = u64::from(coherence);
+            let values = &self.values;
+            let weights = &analysis.weights;
+            let raw = reference.pixels.as_raw();
+            let mut i = 0usize;
+            for y in 0..height {
+                let has_up = y > 0;
+                for x in 0..width {
+                    let has_left = x > 0;
+                    let px = i * 3;
+                    let [c0, c1] = self.two_nearest[key([raw[px], raw[px + 1], raw[px + 2]])];
+                    let left = if has_left { indices[i - 1] } else { c0 };
+                    let up = if has_up { indices[i - width] } else { c0 };
+                    let w = u64::from(weights[i]);
+                    let orig = analysis.colors.at(i);
+                    let t0 = u64::from(has_left && c0 != left) + u64::from(has_up && c0 != up);
+                    let mut best = (distance(values[usize::from(c0)], orig) * w + coh * t0, c0);
+                    if c1 != c0 {
+                        let t1 = u64::from(has_left && c1 != left) + u64::from(has_up && c1 != up);
+                        best =
+                            best.min((distance(values[usize::from(c1)], orig) * w + coh * t1, c1));
+                    }
+                    if has_left && left != c0 && left != c1 {
+                        let tl = u64::from(has_up && left != up);
+                        best = best.min((
+                            distance(values[usize::from(left)], orig) * w + coh * tl,
+                            left,
+                        ));
+                    }
+                    if has_up && up != c0 && up != c1 && (!has_left || up != left) {
+                        let tu = u64::from(has_left);
+                        best =
+                            best.min((distance(values[usize::from(up)], orig) * w + coh * tu, up));
+                    }
+                    let chosen = best.1;
+                    indices.push(chosen);
+                    if !scorer.push(i, values[usize::from(chosen)]) {
+                        return None;
+                    }
+                    i += 1;
+                }
+            }
+            return Some((indices, scorer.finish()));
+        }
+        let (indices, _) =
+            self.map_impl(reference, analysis, coherence, None, false, |i, value| {
+                scorer.push(i, value)
+            })?;
         Some((indices, scorer.finish()))
     }
 
@@ -311,6 +466,12 @@ impl<'a> Mapper<'a> {
                 let index = nearest[i];
                 let mut m = [0u64; 4];
                 m[usize::from(index) / 64] = 1 << (index % 64);
+                m
+            } else if !self.two_nearest.is_empty() {
+                let [c0, c1] = self.two_nearest[key(pixel.0)];
+                let mut m = [0u64; 4];
+                m[usize::from(c0) / 64] |= 1 << (c0 % 64);
+                m[usize::from(c1) / 64] |= 1 << (c1 % 64);
                 m
             } else {
                 let mut m = self.masks[key(pixel.0)];
@@ -516,6 +677,80 @@ pub(crate) fn encode_truecolor_with(
             fast,
         )
     }
+}
+
+pub(crate) fn strip_price_truecolor(mapped: &RgbImage) -> Result<usize, Error> {
+    let width = mapped.width();
+    let height = mapped.height() as usize;
+    let stride = width as usize * 3;
+    let raw = mapped.as_raw();
+    let strips = 8usize;
+    let mut sample = Vec::with_capacity(stride * 16 * strips);
+    for s in 0..strips {
+        let start = s * (height - 16) / (strips - 1);
+        sample.extend_from_slice(&raw[start * stride..(start + 16) * stride]);
+    }
+    let layout = PngLayout {
+        width,
+        height: (16 * strips) as u32,
+        depth: png::BitDepth::Eight,
+        color_type: png::ColorType::Rgb,
+        indexed: None,
+    };
+    Ok(best_filtered(&sample, layout, [true; 5], 1)?.0.len())
+}
+
+pub(crate) fn strip_price_indexed(
+    indices: &[u8],
+    palette: &[[u8; 3]],
+    width: u32,
+    height: u32,
+) -> Result<usize, Error> {
+    let (bits, depth) = match palette.len() {
+        1..=2 => (1, png::BitDepth::One),
+        3..=4 => (2, png::BitDepth::Two),
+        5..=16 => (4, png::BitDepth::Four),
+        17..=256 => (8, png::BitDepth::Eight),
+        _ => return Err(Error::Argument("palette must have 1..=256 entries")),
+    };
+    let colors: Vec<u8> = palette.iter().flatten().copied().collect();
+    let w = width as usize;
+    let h = height as usize;
+    let strips = 8usize;
+    let sample_h = 16 * strips;
+    let sample = if bits == 8 {
+        let mut buf = Vec::with_capacity(w * sample_h);
+        for s in 0..strips {
+            let start = s * (h - 16) / (strips - 1);
+            buf.extend_from_slice(&indices[start * w..(start + 16) * w]);
+        }
+        buf
+    } else {
+        let stride = (w * bits).div_ceil(8);
+        let mut buf = vec![0u8; stride * sample_h];
+        let mut out_y = 0usize;
+        for s in 0..strips {
+            let start = s * (h - 16) / (strips - 1);
+            for y in start..start + 16 {
+                let row = &indices[y * w..(y + 1) * w];
+                let dst = &mut buf[out_y * stride..(out_y + 1) * stride];
+                for (x, &index) in row.iter().enumerate() {
+                    let bit = x * bits;
+                    dst[bit / 8] |= index << (8 - bits - bit % 8);
+                }
+                out_y += 1;
+            }
+        }
+        buf
+    };
+    let layout = PngLayout {
+        width,
+        height: sample_h as u32,
+        depth,
+        color_type: png::ColorType::Indexed,
+        indexed: Some((&colors, &[])),
+    };
+    Ok(best_filtered(&sample, layout, [true; 5], 1)?.0.len())
 }
 
 pub(crate) fn encode_indexed(
@@ -1006,6 +1241,30 @@ mod mapping_tests {
                     .score_with_limits(&expected_rgb, strict_limits)
                     .unwrap();
                 assert_eq!(strict_actual.is_some(), strict_expected.is_some());
+
+                // Also verify non-exact `two_nearest` direct path matches full `map`.
+                let (approx_actual, approx_score) = Mapper::new(&reference, &palette, false)
+                    .map_scored_indices(&reference, &analysis, coherence, None, &high_ctx)
+                    .unwrap();
+                let (approx_expected, approx_rgb) =
+                    Mapper::new(&reference, &palette, false).map(&reference, &analysis, coherence);
+                let approx_expected_score = analysis.score(&approx_rgb).unwrap();
+                assert_eq!(
+                    approx_actual, approx_expected,
+                    "approx palette={count}, coherence={coherence}"
+                );
+                assert_eq!(
+                    approx_score.weighted_pixel_error.to_bits(),
+                    approx_expected_score.weighted_pixel_error.to_bits()
+                );
+                assert_eq!(
+                    approx_score.weighted_edge_error.to_bits(),
+                    approx_expected_score.weighted_edge_error.to_bits()
+                );
+                assert_eq!(
+                    approx_score.worst_tile_error.to_bits(),
+                    approx_expected_score.worst_tile_error.to_bits()
+                );
             }
         }
     }

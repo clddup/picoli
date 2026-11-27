@@ -112,11 +112,33 @@ fn solve<const PRUNE: bool>(
         zeros[i + 1] = zeros[i] + (value * value) as u64;
     }
     let mut states = [None::<State>; 64];
+    let mut min_prefix = 0u64;
     for i in 0..length {
+        if i > 0 {
+            let zero_step = zeros[i] - zeros[i - 1];
+            min_prefix = min_prefix.saturating_add(zero_step);
+            if let Some(prev) = states[i - 1] {
+                min_prefix = min_prefix.min(prev.cost);
+            }
+        }
         let raw = i32::from(source[start + i]);
         let step = u32::from(steps[start + i]);
         let nearest = (raw.unsigned_abs() + step / 2) / step;
-        for size in 1..=10 {
+        let nearest_cat = if nearest == 0 {
+            1u32
+        } else {
+            (32 - nearest.leading_zeros()).min(10)
+        };
+        let mut sizes = [0u32; 10];
+        sizes[0] = nearest_cat;
+        let mut idx = 1usize;
+        for s in 1..=10u32 {
+            if s != nearest_cat {
+                sizes[idx] = s;
+                idx += 1;
+            }
+        }
+        for size in sizes {
             // Within a bit category the rate is constant, so its closest
             // magnitude is the exact minimum of the squared-error term.
             let magnitude = nearest.clamp(1 << (size - 1), (1 << size) - 1);
@@ -127,10 +149,12 @@ fn solve<const PRUNE: bool>(
             }) as i16;
             let residual = i64::from(raw) - i64::from(step) * i64::from(value);
             let error = (residual * residual) as u64;
-            // All predecessor, zero-run and bit costs are nonnegative. This
-            // category cannot improve an existing prefix if its local error
-            // alone is strictly greater. Equality must still retain old ties.
-            if PRUNE && states[i].is_some_and(|best| error > best.cost) {
+            // All predecessor, zero-run and bit costs are nonnegative, and every
+            // valid symbol code has length >= 1. Equality retains old ties.
+            let lower_bound = min_prefix
+                .saturating_add(error)
+                .saturating_add(lambda.saturating_mul(u64::from(size) + 1));
+            if PRUNE && states[i].is_some_and(|best| lower_bound > best.cost) {
                 continue;
             }
             for predecessor in 0..=i {

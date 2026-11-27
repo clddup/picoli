@@ -28,8 +28,8 @@ fn compressor() -> CompressorOxide {
 fn feed(state: &mut CompressorOxide, input: &[u8], finish: bool) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut consumed = 0;
+    let mut buffer = [0u8; 16 * 1024];
     loop {
-        let mut buffer = [0u8; 16 * 1024];
         let (status, used, written) = compress(
             state,
             &input[consumed..],
@@ -64,6 +64,116 @@ fn feed(state: &mut CompressorOxide, input: &[u8], finish: bool) -> Result<Vec<u
     }
     Ok(output)
 }
+
+fn feed_len(state: &mut CompressorOxide, input: &[u8], finish: bool) -> Result<usize, String> {
+    let mut total = 0usize;
+    let mut consumed = 0;
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let (status, used, written) = compress(
+            state,
+            &input[consumed..],
+            &mut buffer,
+            if finish {
+                TDEFLFlush::Finish
+            } else {
+                TDEFLFlush::None
+            },
+        );
+        consumed += used;
+        total += written;
+        match status {
+            TDEFLStatus::BadParam | TDEFLStatus::PutBufFailed => {
+                return Err(format!("compressor error: {status:?}"));
+            }
+            TDEFLStatus::Done => {
+                if !finish || consumed != input.len() {
+                    return Err("premature compressor termination".into());
+                }
+                break;
+            }
+            TDEFLStatus::Okay => {
+                if consumed == input.len() && !finish {
+                    break;
+                }
+                if used == 0 && written == 0 {
+                    return Err("compressor made no progress".into());
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn unfilter_scanlines(
+    filtered: &[u8],
+    stride: usize,
+    height: usize,
+    bpp: usize,
+) -> Result<Vec<u8>, String> {
+    let mut raw = vec![0u8; stride * height];
+    for y in 0..height {
+        let src = &filtered[y * (stride + 1)..(y + 1) * (stride + 1)];
+        let filter = src[0];
+        let payload = &src[1..];
+        let row_start = y * stride;
+        match filter {
+            0 => raw[row_start..row_start + stride].copy_from_slice(payload),
+            1 => {
+                for x in 0..stride {
+                    let left = if x >= bpp {
+                        raw[row_start + x - bpp]
+                    } else {
+                        0
+                    };
+                    raw[row_start + x] = payload[x].wrapping_add(left);
+                }
+            }
+            2 => {
+                if y == 0 {
+                    raw[row_start..row_start + stride].copy_from_slice(payload);
+                } else {
+                    let prev_start = (y - 1) * stride;
+                    for x in 0..stride {
+                        raw[row_start + x] = payload[x].wrapping_add(raw[prev_start + x]);
+                    }
+                }
+            }
+            3 => {
+                let prev_start = y.saturating_sub(1) * stride;
+                for x in 0..stride {
+                    let left = if x >= bpp {
+                        raw[row_start + x - bpp]
+                    } else {
+                        0
+                    };
+                    let up = if y > 0 { raw[prev_start + x] } else { 0 };
+                    let avg = ((u16::from(left) + u16::from(up)) / 2) as u8;
+                    raw[row_start + x] = payload[x].wrapping_add(avg);
+                }
+            }
+            4 => {
+                let prev_start = y.saturating_sub(1) * stride;
+                for x in 0..stride {
+                    let left = if x >= bpp {
+                        raw[row_start + x - bpp]
+                    } else {
+                        0
+                    };
+                    let up = if y > 0 { raw[prev_start + x] } else { 0 };
+                    let ul = if y > 0 && x >= bpp {
+                        raw[prev_start + x - bpp]
+                    } else {
+                        0
+                    };
+                    raw[row_start + x] = payload[x].wrapping_add(paeth(left, up, ul));
+                }
+            }
+            _ => return Err("invalid original PNG row filter".into()),
+        }
+    }
+    Ok(raw)
+}
 fn paeth(a: u8, b: u8, c: u8) -> u8 {
     let p = i16::from(a) + i16::from(b) - i16::from(c);
     let (da, db, dc) = (
@@ -79,6 +189,78 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
         c
     }
 }
+fn filtered_rows_into(
+    raw: &[u8],
+    original: &[u8],
+    stride: usize,
+    bpp: usize,
+    range: std::ops::Range<usize>,
+    choice: u8,
+    result: &mut Vec<u8>,
+) {
+    let (start, end) = (range.start, range.end);
+    result.clear();
+    if choice == 5 {
+        result.extend_from_slice(&original[start * (stride + 1)..end * (stride + 1)]);
+        return;
+    }
+    result.reserve((end - start) * (stride + 1));
+    for y in start..end {
+        result.push(choice);
+        let row = &raw[y * stride..(y + 1) * stride];
+        match choice {
+            0 => result.extend_from_slice(row),
+            1 => {
+                for x in 0..stride {
+                    let left = if x >= bpp { row[x - bpp] } else { 0 };
+                    result.push(row[x].wrapping_sub(left));
+                }
+            }
+            2 => {
+                if y == 0 {
+                    result.extend_from_slice(row);
+                } else {
+                    let prev = &raw[(y - 1) * stride..y * stride];
+                    for x in 0..stride {
+                        result.push(row[x].wrapping_sub(prev[x]));
+                    }
+                }
+            }
+            3 => {
+                let prev = if y > 0 {
+                    Some(&raw[(y - 1) * stride..y * stride])
+                } else {
+                    None
+                };
+                for x in 0..stride {
+                    let left = if x >= bpp { row[x - bpp] } else { 0 };
+                    let up = prev.map_or(0, |p| p[x]);
+                    result.push(row[x].wrapping_sub(((u16::from(left) + u16::from(up)) / 2) as u8));
+                }
+            }
+            4 => {
+                let prev = if y > 0 {
+                    Some(&raw[(y - 1) * stride..y * stride])
+                } else {
+                    None
+                };
+                for x in 0..stride {
+                    let left = if x >= bpp { row[x - bpp] } else { 0 };
+                    let up = prev.map_or(0, |p| p[x]);
+                    let upper_left = if x >= bpp {
+                        prev.map_or(0, |p| p[x - bpp])
+                    } else {
+                        0
+                    };
+                    result.push(row[x].wrapping_sub(paeth(left, up, upper_left)));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[cfg(test)]
 fn filtered_rows(
     raw: &[u8],
     original: &[u8],
@@ -88,36 +270,8 @@ fn filtered_rows(
     end: usize,
     choice: u8,
 ) -> Vec<u8> {
-    if choice == 5 {
-        return original[start * (stride + 1)..end * (stride + 1)].to_vec();
-    }
-    let mut result = Vec::with_capacity((end - start) * (stride + 1));
-    for y in start..end {
-        result.push(choice);
-        for x in 0..stride {
-            let here = raw[y * stride + x];
-            let left = if x >= bpp {
-                raw[y * stride + x - bpp]
-            } else {
-                0
-            };
-            let up = if y > 0 { raw[(y - 1) * stride + x] } else { 0 };
-            let upper_left = if y > 0 && x >= bpp {
-                raw[(y - 1) * stride + x - bpp]
-            } else {
-                0
-            };
-            let predictor = match choice {
-                0 => 0,
-                1 => left,
-                2 => up,
-                3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
-                4 => paeth(left, up, upper_left),
-                _ => unreachable!(),
-            };
-            result.push(here.wrapping_sub(predictor));
-        }
-    }
+    let mut result = Vec::new();
+    filtered_rows_into(raw, original, stride, bpp, start..end, choice, &mut result);
     result
 }
 fn chunk(output: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) -> Result<(), String> {
@@ -204,7 +358,7 @@ fn candidate_impl(
         .min(budget / 4);
     let mut decoder = png::Decoder::new(Cursor::new(input));
     decoder.set_limits(png::Limits { bytes: auxiliary });
-    let mut reader = match decoder.read_info() {
+    let reader = match decoder.read_info() {
         Ok(reader) => reader,
         Err(png::DecodingError::LimitsExceeded) => return Ok(None),
         Err(error) => return Err(error.to_string()),
@@ -213,41 +367,38 @@ fn candidate_impl(
     if size > budget / 4 {
         return Err("research frame capture exceeds explicit memory budget".into());
     }
-    let mut raw = vec![0u8; size];
-    let info = match reader.next_frame(&mut raw) {
-        Ok(info) => info,
-        Err(png::DecodingError::LimitsExceeded) => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
-    raw.truncate(info.buffer_size());
-    drop(reader); // Release decoder row/metadata buffers before branching.
-    let stride = info.line_size;
+    let info = reader.info();
+    let width = info.width as usize;
     let height = info.height as usize;
-    let bpp = (info.color_type.samples() * info.bit_depth as usize).div_ceil(8);
+    let color_type = info.color_type;
+    let bit_depth = info.bit_depth as usize;
+    drop(reader); // Release decoder row/metadata buffers before branching.
+    let stride = (width * color_type.samples() * bit_depth).div_ceil(8);
+    let bpp = (color_type.samples() * bit_depth).div_ceil(8);
     let expected = (stride + 1)
         .checked_mul(height)
         .ok_or("PNG filtered size overflow")?;
     let original = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&idat, expected)
         .map_err(|e| format!("source zlib invalid: {e:?}"))?;
-    if original.len() != expected || raw.len() != stride * height {
+    if original.len() != expected || stride * height != size {
         return Err("PNG scanline size mismatch".into());
     }
-    if original.chunks_exact(stride + 1).any(|row| row[0] > 4) {
-        return Err("invalid original PNG row filter".into());
-    }
+    let raw = unfilter_scanlines(&original, stride, height, bpp)?;
     let group_rows = (65536 / (stride + 1)).max(1);
     let mut state = CompressorOxide::new(create_comp_flags_from_zip_params(1, 15, 0));
     let mut emitted_model_bytes = 0usize;
     let mut selected_rows = Vec::with_capacity(expected);
     let mut choices = Vec::new();
     let mut prefix_sizes = Vec::new();
+    let mut rows = Vec::with_capacity(group_rows * (stride + 1));
+    let mut best_rows = Vec::with_capacity(group_rows * (stride + 1));
     for start in (0..height).step_by(group_rows) {
         let end = (start + group_rows).min(height);
-        let mut best: Option<(usize, u8, CompressorOxide, Vec<u8>)> = None;
+        let mut best: Option<(usize, u8, CompressorOxide, usize)> = None;
         // Original row stream wins exact price ties. Its previous prefix may
         // differ, so retaining this branch alone does not guarantee final gain.
         for choice in [5, 0, 1, 2, 3, 4] {
-            let rows = filtered_rows(&raw, &original, stride, bpp, start, end, choice);
+            filtered_rows_into(&raw, &original, stride, bpp, start..end, choice, &mut rows);
             // Original choice5 was already priced from exactly this state and
             // wins all equal-price ties. Compare complete bytes, not just filter
             // IDs or pixel values: packed-row padding must also be identical.
@@ -258,19 +409,18 @@ fn candidate_impl(
                 continue;
             }
             let mut branch = state.clone();
-            let extra = feed(&mut branch, &rows, false)?;
-            let tail = feed(&mut branch.clone(), &[], true)?;
-            let price = emitted_model_bytes + extra.len() + tail.len();
+            let extra_len = feed_len(&mut branch, &rows, false)?;
+            let tail_len = feed_len(&mut branch.clone(), &[], true)?;
+            let price = emitted_model_bytes + extra_len + tail_len;
             if best.as_ref().is_none_or(|x| price < x.0) {
-                best = Some((price, choice, branch, extra));
+                best = Some((price, choice, branch, extra_len));
+                std::mem::swap(&mut best_rows, &mut rows);
             }
         }
-        let (price, choice, branch, extra) = best.ok_or("no filter branch")?;
+        let (price, choice, branch, extra_len) = best.ok_or("no filter branch")?;
         state = branch;
-        emitted_model_bytes += extra.len();
-        selected_rows.extend_from_slice(&filtered_rows(
-            &raw, &original, stride, bpp, start, end, choice,
-        ));
+        emitted_model_bytes += extra_len;
+        selected_rows.extend_from_slice(&best_rows);
         choices.push(choice);
         prefix_sizes.push(price);
     }

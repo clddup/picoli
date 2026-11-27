@@ -49,6 +49,34 @@ impl CoefficientRateModel {
             )?)
         })
     }
+
+    /// Exact change in `bits()` (`after - before`) when replacing the single
+    /// coefficient at `zigzag_pos` (`1..64`) with `new_value`.
+    /// Validates all AC coefficients in the band containing `zigzag_pos`; callers
+    /// that already validated the block get bit-identical deltas without scanning
+    /// untouched spectral bands.
+    pub fn band_bits_delta(
+        &self,
+        natural: &[i16; 64],
+        zigzag_pos: usize,
+        new_value: i16,
+        chroma: bool,
+    ) -> Option<i32> {
+        if !(1..64).contains(&zigzag_pos) || new_value.unsigned_abs() > 1023 {
+            return None;
+        }
+        let table = &self.codes[usize::from(chroma)];
+        let (start, end) = crate::progressive::ac_ranges(self.scans)
+            .find(|&(s, e)| zigzag_pos >= s && zigzag_pos < e)?;
+        let mut band = [0i16; 64];
+        for z in start..end {
+            band[z] = natural[ZIGZAG[z] as usize & 0x3f];
+        }
+        let before = crate::coefficient_rdo::rate(&band, start, end, table)?;
+        band[zigzag_pos] = new_value;
+        let after = crate::coefficient_rdo::rate(&band, start, end, table)?;
+        Some(after as i32 - before as i32)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -88,6 +116,41 @@ mod tests {
                         .map(|(a, b)| crate::coefficient_rdo::rate(&zz, a, b, &codes).unwrap())
                         .sum();
                     assert_eq!(model.bits(&natural, chroma), Some(expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn band_bits_delta_matches_full_bits_difference() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 32) as u32
+        };
+        for scans in [2, 4] {
+            for chroma in [false, true] {
+                let model = CoefficientRateModel::new(scans).unwrap();
+                for _ in 0..32 {
+                    let mut block = [0i16; 64];
+                    for slot in &mut block[1..] {
+                        let r = next() % 10;
+                        *slot = if r < 6 {
+                            0
+                        } else {
+                            ((next() % 41) as i16) - 20
+                        };
+                    }
+                    let before = model.bits(&block, chroma).unwrap();
+                    for z in 1..64 {
+                        let f = CoefficientRateModel::natural_index(z).unwrap();
+                        let new_val = ((next() % 31) as i16) - 15;
+                        let delta = model.band_bits_delta(&block, z, new_val, chroma).unwrap();
+                        let mut trial = block;
+                        trial[f] = new_val;
+                        let after = model.bits(&trial, chroma).unwrap();
+                        assert_eq!(delta, after as i32 - before as i32);
+                    }
                 }
             }
         }

@@ -62,10 +62,6 @@ pub(crate) fn refine(
     if !admitted(estimate, analysis.memory_budget_bytes) {
         return Ok(());
     }
-    // Keep the full strict current-file boundary. Decode candidate rows with
-    // exact expanded RGBA comparison and finish all chunks, without allocating
-    // a second full RGB/Alpha frame. Raw candidate() alone is still not proof.
-    let before = crate::decode_with_budget(&winner.data, analysis.memory_budget_bytes)?;
     let Some(trial) = super::candidate(
         &winner.data,
         usize::try_from(analysis.memory_budget_bytes).unwrap_or(usize::MAX),
@@ -74,10 +70,14 @@ pub(crate) fn refine(
     else {
         return Ok(());
     };
-    super::streamed::verify(&before, &trial.data, analysis.memory_budget_bytes)?;
     if trial.data.len() >= winner.bytes {
         return Ok(());
     }
+    // Keep the full strict current-file boundary. Decode candidate rows with
+    // exact expanded RGBA comparison and finish all chunks, without allocating
+    // a second full RGB/Alpha frame. Raw candidate() alone is still not proof.
+    let before = crate::decode_with_budget(&winner.data, analysis.memory_budget_bytes)?;
+    super::streamed::verify(&before, &trial.data, analysis.memory_budget_bytes)?;
     let refined = Candidate {
         id: format!("{}-rate-prefix-zlib", winner.id),
         parameters: Parameters::PngRateFiltered {

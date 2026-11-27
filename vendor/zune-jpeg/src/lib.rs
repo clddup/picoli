@@ -171,7 +171,7 @@ pub use zune_core;
 
 #[cfg(feature = "experimental-coefficients")]
 pub use crate::coefficients::{
-    ChromaRenderer, LumaRenderer, QuantizedCoefficients, QuantizedComponent,
+    ChromaRenderer, LumaRenderer, QuantizedCoefficients, QuantizedComponent, StreamReconstructor,
     stream_reconstruct_progressive,
 };
 #[cfg(feature = "experimental-coefficients")]

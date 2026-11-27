@@ -332,6 +332,164 @@ pub(super) fn dequantize(coeff: &[i16; 64], q: &[u16; 64]) -> Result<[i32; 64], 
     Ok(block)
 }
 
+/// Reusable MCU-row-streaming progressive YCbCr->RGB reconstructor.
+/// Reuses decoder scratch buffers across quantization-table searches and
+/// supports on-demand MCU-row quantization so early rejections never quantize
+/// or IDCT later rows.
+pub struct StreamReconstructor {
+    dec: crate::decoder::JpegDecoder<zune_core::bytestream::ZCursor<&'static [u8]>>,
+    upsampler_scratch_space: Vec<i16>,
+    row_buf: Vec<u8>,
+    mcu_height: usize,
+    w: usize,
+    h: usize,
+    padded_width: usize,
+    max_rows_per_mcu: usize,
+}
+
+impl StreamReconstructor {
+    pub fn new(width: u16, height: u16, h_max: u8, v_max: u8) -> Result<Self, DecodeErrors> {
+        use crate::components::{Components, SampleRatios};
+        use crate::decoder::JpegDecoder;
+        use crate::misc::{calculate_padded_width, setup_component_params};
+        use zune_core::bytestream::ZCursor;
+
+        if width == 0 || height == 0 || !matches!((h_max, v_max), (1 | 2, 1) | (2, 2)) {
+            return Err(invalid());
+        }
+        let options = DecoderOptions::default()
+            .set_strict_mode(true)
+            .jpeg_set_out_colorspace(ColorSpace::RGB);
+        let mut dec = JpegDecoder::new_with_options(ZCursor::new(&[][..]), options);
+        dec.info.width = width;
+        dec.info.height = height;
+        dec.info.components = 3;
+        dec.info.sample_ratio = match (h_max, v_max) {
+            (1, 1) => SampleRatios::None,
+            (2, 1) => SampleRatios::H,
+            (2, 2) => SampleRatios::HV,
+            _ => return Err(invalid()),
+        };
+        dec.is_progressive = true;
+        dec.input_colorspace = ColorSpace::YCbCr;
+        dec.qt_tables[0] = Some([1; 64]);
+        dec.qt_tables[1] = Some([1; 64]);
+        let hv = (h_max << 4) | v_max;
+        dec.components = alloc::vec![
+            Components::from([1, hv, 0], 0)?,
+            Components::from([2, 0x11, 1], 1)?,
+            Components::from([3, 0x11, 1], 2)?,
+        ];
+        setup_component_params(&mut dec)?;
+        if dec.is_interleaved {
+            dec.set_upsampling()?;
+        }
+
+        let mcu_height = if dec.is_interleaved {
+            dec.mcu_y
+        } else {
+            usize::from(height).div_ceil(8)
+        };
+        let is_hv = usize::from(dec.is_interleaved);
+        let upsampler_scratch_size = is_hv * dec.components[0].width_stride;
+        let w = usize::from(width);
+        let h = usize::from(height);
+        let padded_width = calculate_padded_width(w, dec.info.sample_ratio);
+        let upsampler_scratch_space = alloc::vec![0i16; upsampler_scratch_size];
+
+        for comp in dec.components.iter_mut() {
+            comp.needed = true;
+            comp.raw_coeff = alloc::vec![0i16; comp.width_stride * comp.vertical_sample * 8];
+        }
+
+        let max_rows_per_mcu = usize::from(v_max) * 8 + usize::from(v_max);
+        let row_buf = alloc::vec![0u8; max_rows_per_mcu * w * 3];
+
+        Ok(Self {
+            dec,
+            upsampler_scratch_space,
+            row_buf,
+            mcu_height,
+            w,
+            h,
+            padded_width,
+            max_rows_per_mcu,
+        })
+    }
+
+    pub fn reconstruct_rows(
+        &mut self,
+        luma_q: &[u16; 64],
+        chroma_q: &[u16; 64],
+        coeffs: &mut [Vec<i16>; 3],
+        mut on_mcu_row: impl FnMut(usize, &mut [Vec<i16>; 3]),
+        mut on_rows: impl FnMut(&[u8]) -> bool,
+    ) -> Result<bool, DecodeErrors> {
+        use crate::mcu::DCT_BLOCK;
+
+        let luma_i32: [i32; 64] = core::array::from_fn(|i| i32::from(luma_q[i]));
+        let chroma_i32: [i32; 64] = core::array::from_fn(|i| i32::from(chroma_q[i]));
+        self.dec.components[0].quantization_table = luma_i32;
+        self.dec.components[1].quantization_table = chroma_i32;
+        self.dec.components[2].quantization_table = chroma_i32;
+
+        for (pos, comp) in self.dec.components.iter_mut().enumerate() {
+            let step = (comp.width_stride / 8) * comp.vertical_sample * 64;
+            let expected = step.checked_mul(self.mcu_height).ok_or_else(invalid)?;
+            if coeffs[pos].len() != expected {
+                return Err(invalid());
+            }
+            comp.idct_pos = 0;
+        }
+
+        let mut tmp = [0i32; DCT_BLOCK];
+        let mut y_written = 0usize;
+
+        for i in 0..self.mcu_height {
+            on_mcu_row(i, coeffs);
+            for (pos, component) in self.dec.components.iter_mut().enumerate() {
+                let qt_table = &component.quantization_table;
+                let mcu_x = component.width_stride / 8;
+                let step = mcu_x * component.vertical_sample * 64;
+                let slice = &coeffs[pos][i * step..(i + 1) * step];
+                let temp_channel = &mut component.raw_coeff;
+                for k in 0..component.vertical_sample {
+                    for j in 0..mcu_x {
+                        let start = j * 64 + k * mcu_x * 64;
+                        let qt_slice = &slice[start..start + 64];
+                        for ((x, out), qt_val) in
+                            qt_slice.iter().zip(tmp.iter_mut()).zip(qt_table.iter())
+                        {
+                            *out = i32::from(*x) * qt_val;
+                        }
+                        let sl = &mut temp_channel[component.idct_pos..];
+                        component.idct_pos += 8;
+                        (self.dec.idct_func)(&mut tmp, sl, component.width_stride);
+                    }
+                    component.idct_pos += 7 * component.width_stride;
+                }
+                component.idct_pos = 0;
+            }
+            let remaining_bytes = (self.h - y_written).min(self.max_rows_per_mcu) * self.w * 3;
+            let mut local_px = 0usize;
+            self.dec.post_process(
+                &mut self.row_buf[..remaining_bytes],
+                i,
+                self.mcu_height,
+                self.w,
+                self.padded_width,
+                &mut local_px,
+                &mut self.upsampler_scratch_space,
+            )?;
+            y_written += local_px / (self.w * 3);
+            if local_px > 0 && !on_rows(&self.row_buf[..local_px]) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
 /// Reconstruct tightly packed RGB MCU-row-by-MCU-row from natural-order quantized
 /// YCbCr coefficients, matching `JpegDecoder::decode` with strict/default options.
 /// Stops immediately if `on_rows` returns `false`.
@@ -345,72 +503,25 @@ pub fn stream_reconstruct_progressive(
     coeffs: [&[i16]; 3],
     mut on_rows: impl FnMut(&[u8]) -> bool,
 ) -> Result<bool, DecodeErrors> {
-    use crate::components::{Components, SampleRatios};
-    use crate::decoder::JpegDecoder;
     use crate::mcu::DCT_BLOCK;
-    use crate::misc::{calculate_padded_width, setup_component_params};
-    use zune_core::bytestream::ZCursor;
 
-    if width == 0 || height == 0 || !matches!((h_max, v_max), (1 | 2, 1) | (2, 2)) {
-        return Err(invalid());
-    }
-    let options = DecoderOptions::default()
-        .set_strict_mode(true)
-        .jpeg_set_out_colorspace(ColorSpace::RGB);
-    let mut dec = JpegDecoder::new_with_options(ZCursor::new(&[][..]), options);
-    dec.info.width = width;
-    dec.info.height = height;
-    dec.info.components = 3;
-    dec.info.sample_ratio = match (h_max, v_max) {
-        (1, 1) => SampleRatios::None,
-        (2, 1) => SampleRatios::H,
-        (2, 2) => SampleRatios::HV,
-        _ => return Err(invalid()),
-    };
-    dec.is_progressive = true;
-    dec.input_colorspace = ColorSpace::YCbCr;
-    dec.qt_tables[0] = Some(core::array::from_fn(|i| i32::from(luma_q[i])));
-    dec.qt_tables[1] = Some(core::array::from_fn(|i| i32::from(chroma_q[i])));
-    let hv = (h_max << 4) | v_max;
-    dec.components = alloc::vec![
-        Components::from([1, hv, 0], 0)?,
-        Components::from([2, 0x11, 1], 1)?,
-        Components::from([3, 0x11, 1], 2)?,
-    ];
-    setup_component_params(&mut dec)?;
-    if dec.is_interleaved {
-        dec.set_upsampling()?;
-    }
-
-    let mcu_height = if dec.is_interleaved {
-        dec.mcu_y
-    } else {
-        usize::from(height).div_ceil(8)
-    };
-    let is_hv = usize::from(dec.is_interleaved);
-    let upsampler_scratch_size = is_hv * dec.components[0].width_stride;
-    let w = usize::from(width);
-    let h = usize::from(height);
-    let padded_width = calculate_padded_width(w, dec.info.sample_ratio);
-    let mut upsampler_scratch_space = alloc::vec![0i16; upsampler_scratch_size];
-    let mut tmp = [0i32; DCT_BLOCK];
-
-    for (pos, comp) in dec.components.iter_mut().enumerate() {
+    let mut rec = StreamReconstructor::new(width, height, h_max, v_max)?;
+    let luma_i32: [i32; 64] = core::array::from_fn(|i| i32::from(luma_q[i]));
+    let chroma_i32: [i32; 64] = core::array::from_fn(|i| i32::from(chroma_q[i]));
+    rec.dec.components[0].quantization_table = luma_i32;
+    rec.dec.components[1].quantization_table = chroma_i32;
+    rec.dec.components[2].quantization_table = chroma_i32;
+    for (pos, comp) in rec.dec.components.iter_mut().enumerate() {
         let step = (comp.width_stride / 8) * comp.vertical_sample * 64;
-        let expected = step.checked_mul(mcu_height).ok_or_else(invalid)?;
+        let expected = step.checked_mul(rec.mcu_height).ok_or_else(invalid)?;
         if coeffs[pos].len() != expected {
             return Err(invalid());
         }
-        comp.needed = true;
-        comp.raw_coeff = alloc::vec![0i16; comp.width_stride * comp.vertical_sample * 8];
     }
-
-    let max_rows_per_mcu = usize::from(v_max) * 8 + usize::from(v_max);
-    let mut row_buf = alloc::vec![0u8; max_rows_per_mcu * w * 3];
+    let mut tmp = [0i32; DCT_BLOCK];
     let mut y_written = 0usize;
-
-    for i in 0..mcu_height {
-        for (pos, component) in dec.components.iter_mut().enumerate() {
+    for i in 0..rec.mcu_height {
+        for (pos, component) in rec.dec.components.iter_mut().enumerate() {
             let qt_table = &component.quantization_table;
             let mcu_x = component.width_stride / 8;
             let step = mcu_x * component.vertical_sample * 64;
@@ -427,25 +538,25 @@ pub fn stream_reconstruct_progressive(
                     }
                     let sl = &mut temp_channel[component.idct_pos..];
                     component.idct_pos += 8;
-                    (dec.idct_func)(&mut tmp, sl, component.width_stride);
+                    (rec.dec.idct_func)(&mut tmp, sl, component.width_stride);
                 }
                 component.idct_pos += 7 * component.width_stride;
             }
             component.idct_pos = 0;
         }
-        let remaining_bytes = (h - y_written).min(max_rows_per_mcu) * w * 3;
+        let remaining_bytes = (rec.h - y_written).min(rec.max_rows_per_mcu) * rec.w * 3;
         let mut local_px = 0usize;
-        dec.post_process(
-            &mut row_buf[..remaining_bytes],
+        rec.dec.post_process(
+            &mut rec.row_buf[..remaining_bytes],
             i,
-            mcu_height,
-            w,
-            padded_width,
+            rec.mcu_height,
+            rec.w,
+            rec.padded_width,
             &mut local_px,
-            &mut upsampler_scratch_space,
+            &mut rec.upsampler_scratch_space,
         )?;
-        y_written += local_px / (w * 3);
-        if local_px > 0 && !on_rows(&row_buf[..local_px]) {
+        y_written += local_px / (rec.w * 3);
+        if local_px > 0 && !on_rows(&rec.row_buf[..local_px]) {
             return Ok(false);
         }
     }

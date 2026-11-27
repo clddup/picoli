@@ -167,9 +167,197 @@ impl<'a> State<'a> {
                 "invalid incremental RGB patch rectangle or length",
             ));
         }
+        // Fast non-mutating single-pass path for small chroma/luma patches (up to 18x18).
+        // Avoids heap allocations, avoids mutating `pixels`/`tiles`/`tile_max` on
+        // rejected trials, and skips unchanged pixels and edges.
+        let limits = strength.limits();
+        let max_tile_bound = bounds.worst_tile_error.min(limits.tile);
+        if width <= 18 && height <= 18 && self.tile_max[1] <= max_tile_bound {
+            let stride = self.pixels.width() as usize;
+            let img_height = self.pixels.height() as usize;
+            let tile_width = stride.div_ceil(16);
+            let raw_pixels = self.pixels.as_raw();
+
+            let mut old_y = [0i32; 324];
+            let mut new_y = [0i32; 324];
+            let mut old_pixel_sum = 0u64;
+            let mut new_pixel_sum = 0u64;
+            // An <=18x18 patch touches at most 2x2 = 4 tiles (or up to 3x3 = 9 if straddling).
+            let mut tile_ids = [usize::MAX; 9];
+            let mut tile_old = [0u64; 9];
+            let mut tile_new = [0u64; 9];
+            let mut tile_count = 0usize;
+
+            for row in 0..height {
+                let y = top + row;
+                let ty = (y / 16) * tile_width;
+                let img_row = y * stride + left;
+                let patch_row = row * width;
+                for col in 0..width {
+                    let x = left + col;
+                    let i = img_row + col;
+                    let p_idx = patch_row + col;
+                    let old_rgb = [
+                        raw_pixels[i * 3],
+                        raw_pixels[i * 3 + 1],
+                        raw_pixels[i * 3 + 2],
+                    ];
+                    let new_rgb = [bytes[p_idx * 3], bytes[p_idx * 3 + 1], bytes[p_idx * 3 + 2]];
+                    if old_rgb == new_rgb {
+                        let yv = color(old_rgb)[0];
+                        old_y[p_idx] = yv;
+                        new_y[p_idx] = yv;
+                        continue;
+                    }
+                    let oc = color(old_rgb);
+                    let nc = color(new_rgb);
+                    old_y[p_idx] = oc[0];
+                    new_y[p_idx] = nc[0];
+                    let w = u64::from(self.analysis.weights[i]);
+                    let src = self.analysis.colors.at(i);
+                    let oe = w * distance(src, oc);
+                    let ne = w * distance(src, nc);
+                    old_pixel_sum += oe;
+                    new_pixel_sum += ne;
+                    if oe != ne {
+                        let leaf = ty + x / 16;
+                        let mut slot = tile_count;
+                        for (k, &tid) in tile_ids.iter().enumerate().take(tile_count) {
+                            if tid == leaf {
+                                slot = k;
+                                break;
+                            }
+                        }
+                        if slot == tile_count {
+                            tile_ids[slot] = leaf;
+                            tile_count += 1;
+                        }
+                        tile_old[slot] += oe;
+                        tile_new[slot] += ne;
+                    }
+                }
+            }
+
+            let candidate_pixel_error = self.pixel_error - old_pixel_sum + new_pixel_sum;
+            let weighted_pixel_error =
+                candidate_pixel_error as f64 / self.total_weight.max(1) as f64;
+            if weighted_pixel_error > bounds.weighted_pixel_error
+                || weighted_pixel_error > limits.pixel
+            {
+                return Ok(false);
+            }
+
+            for k in 0..tile_count {
+                let leaf = tile_ids[k];
+                let (cur_err, weight) = self.tiles[leaf];
+                let new_err = cur_err - tile_old[k] + tile_new[k];
+                let tile_f64 = new_err as f64 / weight.max(1) as f64;
+                if tile_f64 > max_tile_bound {
+                    return Ok(false);
+                }
+            }
+
+            // Compute exact horizontal and vertical edge deltas without mutating pixels.
+            let mut old_edge_sum = 0u64;
+            let mut new_edge_sum = 0u64;
+            let right_edge_end = (left + width + 1).min(stride);
+            for row in 0..height {
+                let y = top + row;
+                let row_off = y * stride;
+                let patch_row = row * width;
+                for x in left.max(1)..right_edge_end {
+                    let i = row_off + x;
+                    let (oy_i, ny_i) = if x < left + width {
+                        let p = patch_row + (x - left);
+                        (old_y[p], new_y[p])
+                    } else {
+                        let yv = self.current_color(i)[0];
+                        (yv, yv)
+                    };
+                    let (oy_p, ny_p) = if x > left {
+                        let p = patch_row + (x - 1 - left);
+                        (old_y[p], new_y[p])
+                    } else {
+                        let yv = self.current_color(i - 1)[0];
+                        (yv, yv)
+                    };
+                    if oy_i == ny_i && oy_p == ny_p {
+                        continue;
+                    }
+                    let src_diff =
+                        self.analysis.colors.at(i)[0] - self.analysis.colors.at(i - 1)[0];
+                    let od = src_diff - (oy_i - oy_p);
+                    let nd = src_diff - (ny_i - ny_p);
+                    let w = u64::from(self.analysis.weights[i]);
+                    old_edge_sum += w * (i64::from(od) * i64::from(od)) as u64;
+                    new_edge_sum += w * (i64::from(nd) * i64::from(nd)) as u64;
+                }
+            }
+            let bottom_edge_end = (top + height + 1).min(img_height);
+            for y in top.max(1)..bottom_edge_end {
+                let row_off = y * stride;
+                for col in 0..width {
+                    let x = left + col;
+                    let i = row_off + x;
+                    let (oy_i, ny_i) = if y < top + height {
+                        let p = (y - top) * width + col;
+                        (old_y[p], new_y[p])
+                    } else {
+                        let yv = self.current_color(i)[0];
+                        (yv, yv)
+                    };
+                    let (oy_p, ny_p) = if y > top {
+                        let p = (y - 1 - top) * width + col;
+                        (old_y[p], new_y[p])
+                    } else {
+                        let yv = self.current_color(i - stride)[0];
+                        (yv, yv)
+                    };
+                    if oy_i == ny_i && oy_p == ny_p {
+                        continue;
+                    }
+                    let src_diff =
+                        self.analysis.colors.at(i)[0] - self.analysis.colors.at(i - stride)[0];
+                    let od = src_diff - (oy_i - oy_p);
+                    let nd = src_diff - (ny_i - ny_p);
+                    let w = u64::from(self.analysis.weights[i]);
+                    old_edge_sum += w * (i64::from(od) * i64::from(od)) as u64;
+                    new_edge_sum += w * (i64::from(nd) * i64::from(nd)) as u64;
+                }
+            }
+
+            let candidate_edge_error = self.edge_error - old_edge_sum + new_edge_sum;
+            let weighted_edge_error = candidate_edge_error as f64 / self.total_weight.max(1) as f64;
+            if weighted_edge_error > bounds.weighted_edge_error || weighted_edge_error > limits.edge
+            {
+                return Ok(false);
+            }
+
+            // Accepted! Commit once directly to pixels, error totals, tiles and segment tree.
+            self.pixel_error = candidate_pixel_error;
+            self.edge_error = candidate_edge_error;
+            for row in 0..height {
+                let first = (top + row) * stride + left;
+                let patch_row = &bytes[row * width * 3..(row + 1) * width * 3];
+                self.pixels.as_mut()[first * 3..(first + width) * 3].copy_from_slice(patch_row);
+            }
+            for k in 0..tile_count {
+                let leaf = tile_ids[k];
+                let (cur_err, weight) = &mut self.tiles[leaf];
+                *cur_err = *cur_err - tile_old[k] + tile_new[k];
+                let mut idx = self.tile_base + leaf;
+                self.tile_max[idx] = *cur_err as f64 / (*weight).max(1) as f64;
+                while idx > 1 {
+                    idx /= 2;
+                    self.tile_max[idx] = self.tile_max[2 * idx].max(self.tile_max[2 * idx + 1]);
+                }
+            }
+            return Ok(true);
+        }
+
         // All fallible work precedes mutation. No state-sized scratch copy is
         // needed: only the tightly packed old patch is retained for rollback.
-        let mut small = [0u8; 192];
+        let mut small = [0u8; 972];
         let mut large = if bytes.len() > small.len() {
             reserved(bytes.len())?
         } else {

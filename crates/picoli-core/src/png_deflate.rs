@@ -216,14 +216,14 @@ pub(crate) fn refine(
     if !admitted(peak, analysis.memory_budget_bytes) {
         return Ok(());
     }
-    let before = crate::decode_with_budget(&winner.data, analysis.memory_budget_bytes)?;
     let Some(trial) = candidate(&winner.data, analysis.memory_budget_bytes)? else {
         return Ok(());
     };
-    crate::png_rate::verify_current(&before, &trial.data, analysis.memory_budget_bytes)?;
     if trial.data.len() >= winner.bytes {
         return Ok(());
     }
+    let before = crate::decode_with_budget(&winner.data, analysis.memory_budget_bytes)?;
+    crate::png_rate::verify_current(&before, &trial.data, analysis.memory_budget_bytes)?;
     candidates.push(Candidate {
         id: format!("{}-deflate-packed", winner.id),
         parameters: Parameters::PngDeflatePacked {

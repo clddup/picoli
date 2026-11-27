@@ -124,7 +124,25 @@ pub fn build_bounded(
         .ok_or(Error::Argument("quantizer model scans must be2/4"))?;
     let cols = (frame.width).div_ceil(8);
     let stride = frame.components[0].block_width;
-    let mut hist: Vec<BTreeMap<u16, Entry>> = (0..64).map(|_| BTreeMap::new()).collect();
+    // Direct-indexed flat histogram for small |FDCT| keys (< 1024) plus BTreeMap
+    // overflow for rare larger values. Preserves exact key order and entry count.
+    const FLAT_LIMIT: usize = 1024;
+    let use_flat = entry_allowance >= 4096;
+    struct FreqHist {
+        flat: Vec<Entry>,
+        flat_present: Vec<u16>,
+        overflow: BTreeMap<u16, Entry>,
+    }
+    impl FreqHist {
+        fn new() -> Self {
+            Self {
+                flat: Vec::new(),
+                flat_present: Vec::new(),
+                overflow: BTreeMap::new(),
+            }
+        }
+    }
+    let mut hist: Vec<FreqHist> = (0..64).map(|_| FreqHist::new()).collect();
     let mut baseline = [(0i128, 0i128); 64];
     let mut remaining_entries = entry_allowance;
     for (index, source) in raw.iter().enumerate() {
@@ -156,15 +174,35 @@ pub fn build_bounded(
                 baseline[natural].1 += weighted;
             }
             let key = source[natural].unsigned_abs();
-            // Lookup allocates nothing. Charge BEFORE entry() can allocate a
-            // root, split a node or grow the map; fixed map overhead is preflighted.
-            if !hist[natural].contains_key(&key) {
-                let Some(left) = remaining_entries.checked_sub(1) else {
-                    return Ok(None);
-                };
-                remaining_entries = left;
-            }
-            let entry = hist[natural].entry(key).or_default();
+            let fh = &mut hist[natural];
+            let entry = if use_flat && usize::from(key) < FLAT_LIMIT {
+                let k = usize::from(key);
+                if fh.flat.is_empty() {
+                    let Some(left) = remaining_entries.checked_sub(1) else {
+                        return Ok(None);
+                    };
+                    remaining_entries = left;
+                    fh.flat.resize_with(FLAT_LIMIT, Entry::default);
+                    fh.flat_present.push(key);
+                } else if fh.flat[k].weight == 0 {
+                    let Some(left) = remaining_entries.checked_sub(1) else {
+                        return Ok(None);
+                    };
+                    remaining_entries = left;
+                    fh.flat_present.push(key);
+                }
+                &mut fh.flat[k]
+            } else {
+                // Lookup allocates nothing. Charge BEFORE entry() can allocate a
+                // root, split a node or grow the map; fixed map overhead is preflighted.
+                if !fh.overflow.contains_key(&key) {
+                    let Some(left) = remaining_entries.checked_sub(1) else {
+                        return Ok(None);
+                    };
+                    remaining_entries = left;
+                }
+                fh.overflow.entry(key).or_default()
+            };
             entry.weight += block_weight;
             if critical {
                 entry.critical += block_weight;
@@ -174,7 +212,10 @@ pub fn build_bounded(
             }
         }
     }
-    let histogram_entries = hist.iter().map(BTreeMap::len).sum();
+    let histogram_entries = hist
+        .iter()
+        .map(|fh| fh.flat_present.len() + fh.overflow.len())
+        .sum();
     let mut curves = Vec::new();
     let (mut base_pixel, mut base_edge, mut base_tile) = (0, 0, 0);
     for natural in 0..64 {
@@ -184,12 +225,16 @@ pub fn build_bounded(
             base_pixel += baseline[natural].0;
             base_edge += baseline[natural].0 * eigen;
             base_tile += baseline[natural].1;
+            let fh = &mut hist[natural];
+            fh.flat_present.sort_unstable();
             for quantizer in 1..=255u16 {
                 let (mut pixel, mut tile, mut bits) = (0i128, 0i128, 0i64);
                 let mut valid = true;
-                for (&source, entry) in &hist[natural] {
-                    let step = 8 * i32::from(quantizer);
-                    let magnitude = (i32::from(source) + step / 2) / step;
+                let step = 8 * i32::from(quantizer);
+                let half_step = step / 2;
+                for &source in &fh.flat_present {
+                    let entry = &fh.flat[usize::from(source)];
+                    let magnitude = (i32::from(source) + half_step) / step;
                     let category = if magnitude == 0 {
                         0
                     } else {
@@ -203,6 +248,24 @@ pub fn build_bounded(
                     pixel += entry.weight * error * error;
                     tile += entry.critical * error * error;
                     bits += entry.rate[category];
+                }
+                if valid {
+                    for (&source, entry) in &fh.overflow {
+                        let magnitude = (i32::from(source) + half_step) / step;
+                        let category = if magnitude == 0 {
+                            0
+                        } else {
+                            32 - magnitude.leading_zeros()
+                        } as usize;
+                        if category > 10 {
+                            valid = false;
+                            break;
+                        }
+                        let error = i128::from(source) - i128::from(step) * i128::from(magnitude);
+                        pixel += entry.weight * error * error;
+                        tile += entry.critical * error * error;
+                        bits += entry.rate[category];
+                    }
                 }
                 if valid {
                     let pixel = pixel - baseline[natural].0;

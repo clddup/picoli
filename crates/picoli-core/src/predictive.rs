@@ -38,7 +38,11 @@ fn paeth(left: u8, up: u8, upper_left: u8) -> i16 {
     }
 }
 
-fn map(reference: &Reference, step: u8) -> Result<RgbImage, Error> {
+fn map_impl(
+    reference: &Reference,
+    step: u8,
+    mut accept: impl FnMut(usize, [u8; 3]) -> bool,
+) -> Result<Option<RgbImage>, Error> {
     if !(1..=16).contains(&step) {
         return Err(Error::Argument("predictive step must be 1..=16"));
     }
@@ -56,38 +60,87 @@ fn map(reference: &Reference, step: u8) -> Result<RgbImage, Error> {
     let src_raw = source.as_raw();
     let alpha_raw = reference.alpha.as_ref().map(|a| a.as_raw().as_slice());
     let mut dst_raw = vec![0u8; src_raw.len()];
-    let step = i16::from(step);
+    let step_i16 = i16::from(step);
+    let half_step = step_i16 / 2;
+
     for y in 0..height {
         let row_off = y * stride;
         let prev_off = row_off.saturating_sub(stride);
         for x in 0..width {
             let p_idx = y * width + x;
             let px = row_off + x * 3;
-            if alpha_raw.is_some_and(|a| a[p_idx] == 0) {
-                dst_raw[px..px + 3].copy_from_slice(&src_raw[px..px + 3]);
-                continue;
-            }
-            for c in 0..3 {
-                let left = if x > 0 { dst_raw[px - 3 + c] } else { 0 };
-                let up = if y > 0 {
-                    dst_raw[prev_off + x * 3 + c]
+            let rgb = if alpha_raw.is_some_and(|a| a[p_idx] == 0) {
+                let r = src_raw[px];
+                let g = src_raw[px + 1];
+                let b = src_raw[px + 2];
+                dst_raw[px] = r;
+                dst_raw[px + 1] = g;
+                dst_raw[px + 2] = b;
+                [r, g, b]
+            } else {
+                let mut out = [0u8; 3];
+                if y == 0 {
+                    if x == 0 {
+                        for c in 0..3 {
+                            let residual = i16::from(src_raw[px + c]);
+                            let quantized = ((residual + half_step) / step_i16) * step_i16;
+                            let v = quantized.clamp(0, 255) as u8;
+                            dst_raw[px + c] = v;
+                            out[c] = v;
+                        }
+                    } else {
+                        for c in 0..3 {
+                            let predicted = i16::from(dst_raw[px - 3 + c]);
+                            let residual = i16::from(src_raw[px + c]) - predicted;
+                            let quantized = residual.signum()
+                                * ((residual.abs() + half_step) / step_i16)
+                                * step_i16;
+                            let v = (predicted + quantized).clamp(0, 255) as u8;
+                            dst_raw[px + c] = v;
+                            out[c] = v;
+                        }
+                    }
+                } else if x == 0 {
+                    for c in 0..3 {
+                        let predicted = i16::from(dst_raw[prev_off + c]);
+                        let residual = i16::from(src_raw[px + c]) - predicted;
+                        let quantized = residual.signum()
+                            * ((residual.abs() + half_step) / step_i16)
+                            * step_i16;
+                        let v = (predicted + quantized).clamp(0, 255) as u8;
+                        dst_raw[px + c] = v;
+                        out[c] = v;
+                    }
                 } else {
-                    0
-                };
-                let upper_left = if x > 0 && y > 0 {
-                    dst_raw[prev_off + (x - 1) * 3 + c]
-                } else {
-                    0
-                };
-                let predicted = paeth(left, up, upper_left);
-                let residual = i16::from(src_raw[px + c]) - predicted;
-                let quantized = residual.signum() * ((residual.abs() + step / 2) / step) * step;
-                dst_raw[px + c] = (predicted + quantized).clamp(0, 255) as u8;
+                    for c in 0..3 {
+                        let left = dst_raw[px - 3 + c];
+                        let up = dst_raw[prev_off + x * 3 + c];
+                        let upper_left = dst_raw[prev_off + (x - 1) * 3 + c];
+                        let predicted = paeth(left, up, upper_left);
+                        let residual = i16::from(src_raw[px + c]) - predicted;
+                        let quantized = residual.signum()
+                            * ((residual.abs() + half_step) / step_i16)
+                            * step_i16;
+                        let v = (predicted + quantized).clamp(0, 255) as u8;
+                        dst_raw[px + c] = v;
+                        out[c] = v;
+                    }
+                }
+                out
+            };
+            if !accept(p_idx, rgb) {
+                return Ok(None);
             }
         }
     }
-    RgbImage::from_raw(source.width(), source.height(), dst_raw)
-        .ok_or(Error::Encoding("predictive RGB buffer mismatch".into()))
+    let image = RgbImage::from_raw(source.width(), source.height(), dst_raw)
+        .ok_or(Error::Encoding("predictive RGB buffer mismatch".into()))?;
+    Ok(Some(image))
+}
+
+fn map(reference: &Reference, step: u8) -> Result<RgbImage, Error> {
+    map_impl(reference, step, |_, _| true)?
+        .ok_or(Error::Encoding("unbounded predictive map rejected".into()))
 }
 
 pub(crate) fn candidate(
@@ -116,20 +169,65 @@ pub(crate) fn search_bounded(
     analysis: &Analysis,
     limits: crate::quality::Limits,
 ) -> Result<Option<Candidate>, Error> {
+    search_bounded_with_target(reference, analysis, limits, None)
+}
+
+pub(crate) fn search_bounded_with_target(
+    reference: &Reference,
+    analysis: &Analysis,
+    limits: crate::quality::Limits,
+    best_png_bytes: Option<usize>,
+) -> Result<Option<Candidate>, Error> {
     let steps = steps(reference);
+    let opaque = if reference.alpha.is_none() {
+        crate::analysis::opaque::OpaqueContext::new(analysis, limits)
+    } else {
+        None
+    };
+    let pixels = reference.pixels.width() as usize * reference.pixels.height() as usize;
+    let use_strip =
+        reference.alpha.is_none() && pixels >= 1_048_576 && reference.pixels.height() >= 192;
     let mut top: Vec<(usize, u8, RgbImage, Score)> = Vec::with_capacity(3);
     for &step in steps {
-        let mapped = map(reference, step)?;
-        let Some(score) = analysis.score_with_limits(&mapped, limits)? else {
-            continue;
+        let (mapped, score) = if let Some(ctx) = &opaque {
+            let mut scorer = ctx.start();
+            let Some(mapped) = map_impl(reference, step, |i, rgb| scorer.push_rgb(i, rgb))? else {
+                continue;
+            };
+            (mapped, scorer.finish())
+        } else {
+            let mapped = map(reference, step)?;
+            let Some(score) = analysis.score_with_limits(&mapped, limits)? else {
+                continue;
+            };
+            (mapped, score)
         };
-        let (fast_data, _) = palette::encode_truecolor_with(reference, &mapped, true)?;
-        top.push((fast_data.len(), step, mapped, score));
+        let rank_bytes = if use_strip {
+            palette::strip_price_truecolor(&mapped)?
+        } else {
+            let (fast_data, _) = palette::encode_truecolor_with(reference, &mapped, true)?;
+            fast_data.len()
+        };
+        top.push((rank_bytes, step, mapped, score));
         top.sort_by_key(|t| (t.0, t.1));
         top.truncate(2);
     }
     if top.is_empty() {
         return Ok(None);
+    }
+    // If an already-finished PNG job beat predictive's best fast level-1 size
+    // by >2x, level-9 deflate cannot close a >2x gap.
+    if let Some(best_known) = best_png_bytes {
+        let top_fast = if use_strip {
+            palette::encode_truecolor_with(reference, &top[0].2, true)?
+                .0
+                .len()
+        } else {
+            top[0].0
+        };
+        if top_fast > best_known.saturating_mul(2) {
+            return Ok(None);
+        }
     }
     let best_fast = top[0].0;
     let threshold = best_fast + best_fast / 50;

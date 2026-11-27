@@ -52,8 +52,8 @@ mod writer;
 pub use encoder::{ChromaSubsamplingMethod, ColorType, Encoder, JpegColorType, SamplingFactor};
 #[cfg(feature = "experimental-coefficients")]
 pub use encoder::{
-    CoefficientRateModel, PreparedFdct, PreparedFdctComponent, QuantizedComponent, QuantizedImage,
-    ScanOptimizationReport,
+    CoefficientRateModel, PreparedFdct, PreparedFdctComponent, PreparedQuantizers,
+    QuantizedComponent, QuantizedImage, ScanOptimizationReport,
 };
 pub use error::EncodingError;
 pub use image_buffer::{ImageBuffer, cmyk_to_ycck, rgb_to_ycbcr};

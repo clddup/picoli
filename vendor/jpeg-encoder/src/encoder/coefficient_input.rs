@@ -31,6 +31,30 @@ pub struct PreparedFdctComponent {
     pub blocks: Vec<AlignedBlock>,
 }
 
+/// Precomputed luma/chroma quantizer tables for repeated row-by-row quantization.
+pub struct PreparedQuantizers {
+    tables: [QuantizationTable; 2],
+}
+
+impl PreparedQuantizers {
+    pub fn new(luma: &[u16; 64], chroma: &[u16; 64]) -> Self {
+        Self {
+            tables: [
+                QuantizationTable::new_with_quality(
+                    &QuantizationTableType::Custom(Box::new(*luma)),
+                    100,
+                    true,
+                ),
+                QuantizationTable::new_with_quality(
+                    &QuantizationTableType::Custom(Box::new(*chroma)),
+                    100,
+                    false,
+                ),
+            ],
+        }
+    }
+}
+
 impl PreparedFdct {
     pub fn new(
         rgb: &[u8],
@@ -138,39 +162,62 @@ impl PreparedFdct {
         })
     }
 
+    pub fn allocate_coeffs(&self) -> [Vec<i16>; 3] {
+        core::array::from_fn(|i| {
+            let comp = &self.components[i];
+            alloc::vec![0i16; comp.block_width * comp.block_height * 64]
+        })
+    }
+
+    /// Quantize a single MCU row (`0..self.mcu_y`) into `out`, which must be
+    /// pre-sized by `allocate_coeffs()`. Allows early-aborting quality checks
+    /// without quantizing later MCU rows.
+    pub fn quantize_mcu_row(
+        &self,
+        mcu_row: usize,
+        quantizers: &PreparedQuantizers,
+        out: &mut [Vec<i16>; 3],
+    ) {
+        for (i, comp) in self.components.iter().enumerate() {
+            let table = &quantizers.tables[usize::from(i > 0)];
+            let vs = usize::from(comp.v_sample);
+            let by_start = mcu_row * vs;
+            let by_end = (by_start + vs).min(comp.block_height);
+            for by in by_start..by_end {
+                let row_dst = by * comp.block_width * 64;
+                if by < comp.rows {
+                    for bx in 0..comp.cols {
+                        let src = &comp.blocks[by * comp.cols + bx].data;
+                        let dst = &mut out[i][row_dst + bx * 64..row_dst + (bx + 1) * 64];
+                        for z in 0..64 {
+                            dst[z] = table.quantize(src[z], z);
+                        }
+                    }
+                    if comp.cols < comp.block_width {
+                        out[i][row_dst + comp.cols * 64..row_dst + comp.block_width * 64].fill(0);
+                    }
+                } else {
+                    out[i][row_dst..row_dst + comp.block_width * 64].fill(0);
+                }
+            }
+        }
+    }
+
     pub fn quantize_into(
         &self,
         luma: &[u16; 64],
         chroma: &[u16; 64],
         out: &mut [Vec<i16>; 3],
     ) {
-        let q_tables = [
-            QuantizationTable::new_with_quality(
-                &QuantizationTableType::Custom(Box::new(*luma)),
-                100,
-                true,
-            ),
-            QuantizationTable::new_with_quality(
-                &QuantizationTableType::Custom(Box::new(*chroma)),
-                100,
-                false,
-            ),
-        ];
+        let quantizers = PreparedQuantizers::new(luma, chroma);
         for (i, comp) in self.components.iter().enumerate() {
-            let table = &q_tables[usize::from(i > 0)];
             let total = comp.block_width * comp.block_height * 64;
-            out[i].clear();
-            out[i].resize(total, 0);
-            for by in 0..comp.rows {
-                for bx in 0..comp.cols {
-                    let src = &comp.blocks[by * comp.cols + bx].data;
-                    let dst_off = (by * comp.block_width + bx) * 64;
-                    let dst = &mut out[i][dst_off..dst_off + 64];
-                    for z in 0..64 {
-                        dst[z] = table.quantize(src[z], z);
-                    }
-                }
+            if out[i].len() != total {
+                out[i].resize(total, 0);
             }
+        }
+        for mcu_row in 0..self.mcu_y {
+            self.quantize_mcu_row(mcu_row, &quantizers, out);
         }
     }
 }

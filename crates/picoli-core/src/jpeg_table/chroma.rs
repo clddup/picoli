@@ -42,10 +42,6 @@ fn descend(value: i16) -> Option<i16> {
     let category = 16 - m.leading_zeros();
     Some((((1u16 << (category - 1)) - 1) as i16) * value.signum())
 }
-fn bits(rate: &CoefficientRateModel, b: &[i16; 64]) -> Result<u32, Error> {
-    rate.bits(b, true)
-        .ok_or(Error::Argument("chroma block outside legal AC domain"))
-}
 fn preview(
     renderer: &ChromaRenderer,
     component: usize,
@@ -205,8 +201,9 @@ pub(super) fn refine(
     };
     let mut best = None;
     for paired in [false, true] {
-        if let Some(alt) = pass(r, a, current, sampling, coding, &admit, strength, paired)?
-            && alt.data.len() < current.bytes
+        if let Some(alt) = pass_with_identity(
+            r, a, current, sampling, coding, &admit, strength, paired, !paired,
+        )? && alt.data.len() < current.bytes
             && nonworse(&alt.score, &current.score, strength)
             && best
                 .as_ref()
@@ -237,6 +234,7 @@ pub(super) fn refine(
     }
     Ok(())
 }
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn pass(
     reference: &Reference,
@@ -248,17 +246,36 @@ fn pass(
     strength: Strength,
     paired: bool,
 ) -> Result<Option<Alternative>, Error> {
+    pass_with_identity(
+        reference, a, current, sampling, coding, admit, strength, paired, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pass_with_identity(
+    reference: &Reference,
+    a: &Analysis,
+    current: &Candidate,
+    sampling: u16,
+    coding: Coding,
+    admit: &Admission,
+    strength: Strength,
+    paired: bool,
+    verify_identity: bool,
+) -> Result<Option<Alternative>, Error> {
     let Captured { mut frame, pixels } =
         coefficient_io::capture_generated(&current.data, reference, sampling, admit.coefficients)?;
-    let identity =
-        coefficient_io::serialize_bounded(reference, &frame, coding, admit.output_limit)?
-            .ok_or(Error::Encoding("chroma OFF exceeded full control".into()))?;
-    if identity != current.data {
-        return Err(Error::Encoding(
-            "chroma OFF differs from complete generated control".into(),
-        ));
+    if verify_identity {
+        let identity =
+            coefficient_io::serialize_bounded(reference, &frame, coding, admit.output_limit)?
+                .ok_or(Error::Encoding("chroma OFF exceeded full control".into()))?;
+        if identity != current.data {
+            return Err(Error::Encoding(
+                "chroma OFF differs from complete generated control".into(),
+            ));
+        }
+        drop(identity);
     }
-    drop(identity);
     let bounds = &current.score;
     let control_score = a.score(&pixels)?;
     if !same(&control_score, bounds) {
@@ -283,6 +300,7 @@ fn pass(
         .ok_or(Error::Argument("chroma requires2/4 scans"))?;
     let mut stats = PassStats::default();
     let mut rgb = [0u8; 972];
+    let mut saved = [0i16; 64];
     // Complete raster traversal, then SOF-order Cb/Cr and one forward zigzag.
     let cols = frame.components[1].block_width;
     let rows = frame.components[1].block_height;
@@ -296,6 +314,9 @@ fn pass(
                     [start..start + 64]
                     .try_into()
                     .map_err(|_| Error::Argument("bad chroma block"))?;
+                if block[1..].iter().any(|c| c.unsigned_abs() > 1023) {
+                    return Err(Error::Argument("chroma block outside legal AC domain"));
+                }
                 for zigzag in 1..64 {
                     let f = CoefficientRateModel::natural_index(zigzag)
                         .ok_or(Error::Argument("bad chroma zigzag"))?;
@@ -304,12 +325,14 @@ fn pass(
                     };
                     stats.nonzero_positions += 1;
                     stats.category_proposals += 1;
-                    let before_bits = bits(&rate, &block)?;
+                    let delta_bits = rate
+                        .band_bits_delta(&block, zigzag, value, true)
+                        .ok_or(Error::Argument("chroma block outside legal AC domain"))?;
                     let mut trial = block;
                     trial[f] = value;
-                    let after_bits = bits(&rate, &trial)?;
                     let mut accepted = false;
-                    if after_bits < before_bits {
+                    let mut primary_unsafe = false;
+                    if delta_bits < 0 {
                         if let Some(rect) =
                             preview(&renderer, component, bx, by, &trial, &mut rgb, &mut stats)?
                         {
@@ -325,20 +348,24 @@ fn pass(
                                 block = trial;
                                 accepted = true;
                                 stats.committed += 1;
-                                stats.modeled_bits_saved += u64::from(before_bits - after_bits);
+                                stats.modeled_bits_saved += (-delta_bits) as u64;
                             } else {
                                 stats.rejected_quality += 1;
                             }
+                        } else {
+                            primary_unsafe = true;
                         }
                     } else {
                         stats.prior_rate_rejections += 1;
                     }
-                    if !accepted && paired {
+                    if !accepted && paired && !primary_unsafe {
                         let other_block: [i16; 64] = frame.components[other].coefficients
                             [start..start + 64]
                             .try_into()
                             .map_err(|_| Error::Argument("bad compensating chroma block"))?;
-                        let other_bits = bits(&rate, &other_block)?;
+                        if other_block[1..].iter().any(|c| c.unsigned_abs() > 1023) {
+                            return Err(Error::Argument("chroma block outside legal AC domain"));
+                        }
                         // The pending primary edit never enters the score state alone.
                         // A rejected joint trial restores the renderer before continuing.
                         let mut pending = false;
@@ -349,29 +376,28 @@ fn pass(
                             else {
                                 continue;
                             };
-                            let mut pair = other_block;
-                            pair[f] = g;
-                            let pair_bits = bits(&rate, &pair)?;
-                            let before = u64::from(before_bits) + u64::from(other_bits);
-                            let after = u64::from(after_bits) + u64::from(pair_bits);
-                            if after >= before {
+                            let pair_delta = rate
+                                .band_bits_delta(&other_block, zigzag, g, true)
+                                .ok_or(Error::Argument("chroma block outside legal AC domain"))?;
+                            let total_delta = i64::from(delta_bits) + i64::from(pair_delta);
+                            if total_delta >= 0 {
                                 stats.prior_rate_rejections += 1;
                                 continue;
                             }
-                            // Check primary safety without changing either retained plane.
                             if !pending {
-                                if preview(
-                                    &renderer, component, bx, by, &trial, &mut rgb, &mut stats,
-                                )?
-                                .is_none()
-                                {
-                                    break;
+                                match renderer.swap_block(component, bx, by, &trial, &mut saved) {
+                                    Ok(()) => pending = true,
+                                    Err(zune_jpeg::errors::DecodeErrors::FormatStatic(
+                                        "Luma renderer: coefficient arithmetic exceeds safe IDCT bounds",
+                                    )) => {
+                                        stats.rejected_safety += 1;
+                                        break;
+                                    }
+                                    Err(e) => return Err(Error::InvalidJpeg(e.to_string())),
                                 }
-                                renderer
-                                    .commit_block(component, bx, by, &trial)
-                                    .map_err(|e| Error::InvalidJpeg(e.to_string()))?;
-                                pending = true;
                             }
+                            let mut pair = other_block;
+                            pair[f] = g;
                             if let Some(rect) =
                                 preview(&renderer, other, bx, by, &pair, &mut rgb, &mut stats)?
                             {
@@ -390,7 +416,7 @@ fn pass(
                                     accepted = true;
                                     stats.committed += 1;
                                     stats.compensated_commits += 1;
-                                    stats.modeled_bits_saved += before - after;
+                                    stats.modeled_bits_saved += (-total_delta) as u64;
                                     break;
                                 } else {
                                     stats.rejected_quality += 1;
@@ -398,9 +424,7 @@ fn pass(
                             }
                         }
                         if pending && !accepted {
-                            renderer
-                                .commit_block(component, bx, by, &block)
-                                .map_err(|e| Error::InvalidJpeg(e.to_string()))?;
+                            renderer.restore_block(component, bx, by, &saved);
                         }
                     }
                 }

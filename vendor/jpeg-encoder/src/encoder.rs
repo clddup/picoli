@@ -13,7 +13,8 @@ mod coefficient_input;
 mod optimized_scan;
 #[cfg(feature = "experimental-coefficients")]
 pub use coefficient_input::{
-    CoefficientRateModel, PreparedFdct, PreparedFdctComponent, QuantizedComponent, QuantizedImage,
+    CoefficientRateModel, PreparedFdct, PreparedFdctComponent, PreparedQuantizers,
+    QuantizedComponent, QuantizedImage,
 };
 #[cfg(feature = "experimental-coefficients")]
 pub use optimized_scan::ScanOptimizationReport;
@@ -1241,6 +1242,31 @@ impl<W: JfifWrite> Encoder<W> {
                 self.ac_rdo_lambda
             };
 
+            let rdo_setup = if self.ac_rdo_lambda > 0 {
+                let table = &q_tables[component.quantization_table as usize];
+                let steps =
+                    core::array::from_fn(|i| table.coefficient_step(ZIGZAG[i] as usize & 0x3f));
+                let codes = core::array::from_fn(|symbol| {
+                    // Standard8-bit AC priors define EOB, ZRL and
+                    // run/category1..10 only. The accessor rejects
+                    // absent symbols under debug assertions.
+                    if symbol == 0 || symbol == 0xf0 || (1..=10).contains(&(symbol & 15)) {
+                        self.huffman_tables[component.ac_huffman_table as usize]
+                            .1
+                            .get_for_value(symbol as u8)
+                            .0
+                    } else {
+                        0
+                    }
+                });
+                let scans = self
+                    .progressive_scans
+                    .expect("validated progressive configuration");
+                Some((steps, codes, scans))
+            } else {
+                None
+            };
+
             for block_y in 0..rows {
                 for block_x in 0..cols {
                     let bx = block_x * 8 * h_scale;
@@ -1261,37 +1287,17 @@ impl<W: JfifWrite> Encoder<W> {
                         &q_tables[component.quantization_table as usize],
                     );
 
-                    if self.ac_rdo_lambda > 0 {
-                        let table = &q_tables[component.quantization_table as usize];
+                    if let Some((ref steps, ref codes, scans)) = rdo_setup {
                         let source =
                             core::array::from_fn(|i| block.data[ZIGZAG[i] as usize & 0x3f]);
-                        let steps = core::array::from_fn(|i| {
-                            table.coefficient_step(ZIGZAG[i] as usize & 0x3f)
-                        });
-                        let codes = core::array::from_fn(|symbol| {
-                            // Standard8-bit AC priors define EOB, ZRL and
-                            // run/category1..10 only. The accessor rejects
-                            // absent symbols under debug assertions.
-                            if symbol == 0 || symbol == 0xf0 || (1..=10).contains(&(symbol & 15)) {
-                                self.huffman_tables[component.ac_huffman_table as usize]
-                                    .1
-                                    .get_for_value(symbol as u8)
-                                    .0
-                            } else {
-                                0
-                            }
-                        });
-                        let scans = self
-                            .progressive_scans
-                            .expect("validated progressive configuration");
                         for (start, end) in crate::progressive::ac_ranges(scans) {
                             let solution = crate::coefficient_rdo::optimize(
                                 &source,
-                                &steps,
+                                steps,
                                 &q_block.data,
                                 start,
                                 end,
-                                &codes,
+                                codes,
                                 model_lambda,
                             )
                             .expect("valid8-bit coefficient model and complete standard AC prior");

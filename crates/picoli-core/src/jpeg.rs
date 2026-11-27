@@ -9,7 +9,7 @@ use jpeg_encoder::{
 };
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Shape {
     Standard,
@@ -225,7 +225,9 @@ pub(crate) fn candidate(
 pub(crate) struct PreparedSampling {
     sampling: u16,
     fdct: jpeg_encoder::PreparedFdct,
+    reconstructor: zune_jpeg::StreamReconstructor,
     coeffs: [Vec<i16>; 3],
+    last_quantized: Option<(Shape, u16)>,
 }
 
 impl PreparedSampling {
@@ -253,64 +255,104 @@ impl PreparedSampling {
             ChromaSubsamplingMethod::Average,
         )
         .map_err(|e| Error::Encoding(e.to_string()))?;
+        let reconstructor = zune_jpeg::StreamReconstructor::new(
+            fdct.width,
+            fdct.height,
+            fdct.h_max as u8,
+            fdct.v_max as u8,
+        )
+        .map_err(|e| Error::InvalidJpeg(e.to_string()))?;
+        let coeffs = fdct.allocate_coeffs();
         Ok(Self {
             sampling,
             fdct,
-            coeffs: [Vec::new(), Vec::new(), Vec::new()],
+            reconstructor,
+            coeffs,
+            last_quantized: None,
         })
+    }
+
+    fn ensure_quantized(
+        &mut self,
+        analysis: &Analysis,
+        shape: Shape,
+        scale: u16,
+    ) -> ([u16; 64], [u16; 64]) {
+        let (luma, chroma) = tables(analysis, shape, scale);
+        if self.last_quantized != Some((shape, scale)) {
+            self.fdct.quantize_into(&luma, &chroma, &mut self.coeffs);
+            self.last_quantized = Some((shape, scale));
+        }
+        (luma, chroma)
     }
 }
 
-pub(crate) fn candidate_prepared(
+pub(crate) fn score_prepared(
     prepared: &mut PreparedSampling,
     reference: &Reference,
     analysis: &Analysis,
     shape: Shape,
     scale: u16,
     limits: crate::quality::Limits,
-) -> Result<Option<Candidate>, Error> {
+) -> Result<Option<crate::analysis::Score>, Error> {
     let Some(context) = crate::analysis::opaque::OpaqueContext::new(analysis, limits) else {
-        return candidate_bounded(reference, analysis, shape, prepared.sampling, scale, limits);
+        return Ok(candidate_bounded(
+            reference,
+            analysis,
+            shape,
+            prepared.sampling,
+            scale,
+            limits,
+        )?
+        .map(|c| c.score));
     };
     let (luma, chroma) = tables(analysis, shape, scale);
-    prepared
-        .fdct
-        .quantize_into(&luma, &chroma, &mut prepared.coeffs);
+    let quantizers = jpeg_encoder::PreparedQuantizers::new(&luma, &chroma);
+    // Early-rejected probes only quantize the prefix of MCU rows needed to fail.
+    prepared.last_quantized = None;
 
     let mut scorer = context.start();
     let mut pixel_index = 0usize;
-    let accepted = zune_jpeg::stream_reconstruct_progressive(
-        prepared.fdct.width,
-        prepared.fdct.height,
-        prepared.fdct.h_max as u8,
-        prepared.fdct.v_max as u8,
-        &luma,
-        &chroma,
-        [
-            &prepared.coeffs[0],
-            &prepared.coeffs[1],
-            &prepared.coeffs[2],
-        ],
-        |row_rgb| {
-            for p in row_rgb.chunks_exact(3) {
-                if !scorer.push_rgb(pixel_index, [p[0], p[1], p[2]]) {
+    let fdct = &prepared.fdct;
+    let accepted = prepared
+        .reconstructor
+        .reconstruct_rows(
+            &luma,
+            &chroma,
+            &mut prepared.coeffs,
+            |mcu_row, coeffs| {
+                fdct.quantize_mcu_row(mcu_row, &quantizers, coeffs);
+            },
+            |row_rgb| {
+                if !scorer.push_rgb_rows(pixel_index, row_rgb) {
                     return false;
                 }
-                pixel_index += 1;
-            }
-            true
-        },
-    )
-    .map_err(|e| Error::InvalidJpeg(e.to_string()))?;
+                pixel_index += row_rgb.len() / 3;
+                true
+            },
+        )
+        .map_err(|e| Error::InvalidJpeg(e.to_string()))?;
     if !accepted {
         return Ok(None);
     }
+    prepared.last_quantized = Some((shape, scale));
     let score = scorer.finish();
     debug_assert_eq!(
         pixel_index,
         usize::from(prepared.fdct.width) * usize::from(prepared.fdct.height)
     );
+    Ok(Some(score))
+}
 
+pub(crate) fn encode_prepared(
+    prepared: &mut PreparedSampling,
+    reference: &Reference,
+    analysis: &Analysis,
+    shape: Shape,
+    scale: u16,
+    score: crate::analysis::Score,
+) -> Result<Candidate, Error> {
+    let (luma, chroma) = prepared.ensure_quantized(analysis, shape, scale);
     let components = [
         jpeg_encoder::QuantizedComponent {
             horizontal_sampling_factor: prepared.fdct.components[0].h_sample,
@@ -354,7 +396,7 @@ pub(crate) fn candidate_prepared(
         Err(_) => encode(reference, analysis, shape, prepared.sampling, scale)?,
     };
 
-    Ok(Some(Candidate {
+    Ok(Candidate {
         id: format!("jpeg-{shape:?}-{}-scale{scale}", prepared.sampling),
         bytes: data.len(),
         data,
@@ -370,7 +412,24 @@ pub(crate) fn candidate_prepared(
             quantization_margin_percent: 100,
             coefficient_rdo_sampling_weights: false,
         },
-    }))
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn candidate_prepared(
+    prepared: &mut PreparedSampling,
+    reference: &Reference,
+    analysis: &Analysis,
+    shape: Shape,
+    scale: u16,
+    limits: crate::quality::Limits,
+) -> Result<Option<Candidate>, Error> {
+    let Some(score) = score_prepared(prepared, reference, analysis, shape, scale, limits)? else {
+        return Ok(None);
+    };
+    Ok(Some(encode_prepared(
+        prepared, reference, analysis, shape, scale, score,
+    )?))
 }
 
 pub(crate) fn candidate_bounded(

@@ -35,7 +35,15 @@ pub(super) fn solve(
     }
     let mut states = [None::<State>; 64];
     let mut groups = [None::<Group>; 16];
+    let mut min_prefix = 0u64;
     for i in 0..length {
+        if i > 0 {
+            let zero_step = zeros[i] - zeros[i - 1];
+            min_prefix = min_prefix.saturating_add(zero_step);
+            if let Some(prev) = states[i - 1] {
+                min_prefix = min_prefix.min(prev.cost);
+            }
+        }
         let previous = i.checked_sub(1);
         let prefix = match previous {
             None => Some(0),
@@ -65,7 +73,21 @@ pub(super) fn solve(
         let raw = i32::from(source[start + i]);
         let step = u32::from(steps[start + i]);
         let nearest = (raw.unsigned_abs() + step / 2) / step;
-        for size in 1..=10 {
+        let nearest_cat = if nearest == 0 {
+            1u32
+        } else {
+            (32 - nearest.leading_zeros()).min(10)
+        };
+        let mut sizes = [0u32; 10];
+        sizes[0] = nearest_cat;
+        let mut idx = 1usize;
+        for s in 1..=10u32 {
+            if s != nearest_cat {
+                sizes[idx] = s;
+                idx += 1;
+            }
+        }
+        for size in sizes {
             let magnitude = nearest.clamp(1 << (size - 1), (1 << size) - 1);
             let value = (if raw < 0 {
                 -(magnitude as i32)
@@ -74,7 +96,10 @@ pub(super) fn solve(
             }) as i16;
             let residual = i64::from(raw) - i64::from(step) * i64::from(value);
             let error = (residual * residual) as u64;
-            if states[i].is_some_and(|best| error > best.cost) {
+            let lower_bound = min_prefix
+                .saturating_add(error)
+                .saturating_add(lambda.saturating_mul(u64::from(size) + 1));
+            if states[i].is_some_and(|best| lower_bound > best.cost) {
                 continue;
             }
             for group in groups.iter().flatten() {

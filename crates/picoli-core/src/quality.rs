@@ -104,9 +104,14 @@ pub fn run_job(
     match job {
         Job::Jpeg { shape, sampling } => {
             let mut prepared = jpeg::PreparedSampling::new(reference, sampling)?;
-            crate::jpeg_search::run_bounded(strength, |scale| {
-                jpeg::candidate_prepared(&mut prepared, reference, analysis, shape, scale, limits)
-            })
+            crate::jpeg_search::run_prepared(
+                &mut prepared,
+                strength,
+                |p, scale| jpeg::score_prepared(p, reference, analysis, shape, scale, limits),
+                |p, scale, score| {
+                    jpeg::encode_prepared(p, reference, analysis, shape, scale, score)
+                },
+            )
         }
         Job::PngPredictive => predictive::search_bounded(reference, analysis, limits),
         Job::PngLossless => {
@@ -120,135 +125,173 @@ pub fn run_job(
             }))
         }
         Job::Png { colors } => {
-            if !(2..=256).contains(&colors) {
-                return Err(Error::Argument("palette size must be 2..=256"));
-            }
-            let palette = palette::train(reference, analysis, colors);
-            let opaque = if reference.alpha.is_none() {
-                crate::analysis::opaque::OpaqueContext::new(analysis, limits)
-            } else {
-                None
-            };
-            struct FastTrial {
-                fast_bytes: usize,
-                id: String,
-                coherence: u32,
-                exact: bool,
-                indices: Vec<u8>,
-                reconstructed: Option<image::RgbImage>,
-                score: Score,
-            }
-            let mut top_trials: Vec<FastTrial> = Vec::with_capacity(3);
-            for exact in [false, true] {
-                // Keep the original mapping candidates as controls. The exact
-                // mode targets dense palettes, where two guesses can miss.
-                if exact && palette.len() < 64 {
-                    continue;
-                }
-                let mut mapper = palette::Mapper::new(reference, &palette, exact);
-                let mut exact_nearest: Option<Vec<u8>> = None;
-                let coherences: &[u32] = if palette.len() <= 1 {
-                    &[0]
-                } else {
-                    &[0, 64, 256, 1024, 2048, 4096, 8192]
-                };
-                for &coherence in coherences {
-                    let (indices, reconstructed, score) = if let Some(context) = &opaque {
-                        let nearest_ref = if exact && coherence > 0 {
-                            exact_nearest.as_deref()
-                        } else {
-                            None
-                        };
-                        let Some((indices, score)) = mapper.map_scored_indices(
-                            reference,
-                            analysis,
-                            coherence,
-                            nearest_ref,
-                            context,
-                        ) else {
-                            continue;
-                        };
-                        if exact && coherence == 0 {
-                            exact_nearest = Some(indices.clone());
-                        }
-                        (indices, None, score)
-                    } else {
-                        let (indices, reconstructed) = mapper.map(reference, analysis, coherence);
-                        let Some(score) = analysis.score_with_limits(&reconstructed, limits)?
-                        else {
-                            continue;
-                        };
-                        (indices, Some(reconstructed), score)
-                    };
-                    let (fast_data, _) = palette::encode_for_reference_with(
-                        reference,
-                        &indices,
-                        &palette,
-                        reconstructed.as_ref(),
-                        true,
-                    )?;
-                    let id = if exact {
-                        format!("png-exact-{colors}-coherence-{coherence}")
-                    } else {
-                        format!("png-{colors}-coherence-{coherence}")
-                    };
-                    top_trials.push(FastTrial {
-                        fast_bytes: fast_data.len(),
-                        id,
-                        coherence,
-                        exact,
-                        indices,
-                        reconstructed,
-                        score,
-                    });
-                    top_trials.sort_by(|a, b| (a.fast_bytes, &a.id).cmp(&(b.fast_bytes, &b.id)));
-                    top_trials.truncate(2);
-                }
-            }
-            if top_trials.is_empty() {
-                return Ok(None);
-            }
-            let best_fast = top_trials[0].fast_bytes;
-            let threshold = best_fast + best_fast / 50; // within 2% of fast winner
-            let mut result: Option<Candidate> = None;
-            for (rank, trial) in top_trials.into_iter().enumerate() {
-                if rank > 0 && trial.fast_bytes > threshold {
-                    break;
-                }
-                let (data, filter) = palette::encode_for_reference_with(
-                    reference,
-                    &trial.indices,
-                    &palette,
-                    trial.reconstructed.as_ref(),
-                    false,
-                )?;
-                let c = Candidate {
-                    id: trial.id,
-                    parameters: Parameters::Png {
-                        colors: palette.len(),
-                        coherence: trial.coherence,
-                        filter,
-                        mapping: if trial.exact {
-                            "exact_cell_bounds"
-                        } else {
-                            "cell_two_nearest"
-                        },
-                        palette_order: "as_generated",
-                    },
-                    bytes: data.len(),
-                    data,
-                    score: trial.score,
-                };
-                if result
-                    .as_ref()
-                    .is_none_or(|old| (c.bytes, &c.id) < (old.bytes, &old.id))
-                {
-                    result = Some(c);
-                }
-            }
-            Ok(result)
+            let hist = palette::Histogram::new(reference, analysis);
+            run_png_palette_job(reference, analysis, &hist, colors, limits, None)
         }
     }
+}
+
+fn run_png_palette_job(
+    reference: &Reference,
+    analysis: &Analysis,
+    hist: &palette::Histogram,
+    colors: usize,
+    limits: Limits,
+    best_png_bytes: Option<usize>,
+) -> Result<Option<Candidate>, Error> {
+    if !(2..=256).contains(&colors) {
+        return Err(Error::Argument("palette size must be 2..=256"));
+    }
+    let palette = palette::train_from_histogram(hist, colors);
+    let opaque = if reference.alpha.is_none() {
+        crate::analysis::opaque::OpaqueContext::new(analysis, limits)
+    } else {
+        None
+    };
+    let pixels = reference.pixels.width() as usize * reference.pixels.height() as usize;
+    let use_strip =
+        reference.alpha.is_none() && pixels >= 1_048_576 && reference.pixels.height() >= 192;
+    struct FastTrial {
+        fast_bytes: usize,
+        id: String,
+        coherence: u32,
+        exact: bool,
+        indices: Vec<u8>,
+        reconstructed: Option<image::RgbImage>,
+        score: Score,
+    }
+    let mut top_trials: Vec<FastTrial> = Vec::with_capacity(3);
+    for exact in [false, true] {
+        // Keep the original mapping candidates as controls. The exact
+        // mode targets dense palettes, where two guesses can miss.
+        if exact && palette.len() < 64 {
+            continue;
+        }
+        let mut mapper = palette::Mapper::with_histogram(reference, hist, &palette, exact);
+        let mut zero_nearest: Option<Vec<u8>> = None;
+        let coherences: &[u32] = if palette.len() <= 1 {
+            &[0]
+        } else {
+            &[0, 64, 256, 1024, 2048, 4096, 8192]
+        };
+        for &coherence in coherences {
+            let (indices, reconstructed, score) = if let Some(context) = &opaque {
+                let nearest_ref = if exact && coherence > 0 {
+                    zero_nearest.as_deref()
+                } else {
+                    None
+                };
+                let Some((indices, score)) =
+                    mapper.map_scored_indices(reference, analysis, coherence, nearest_ref, context)
+                else {
+                    continue;
+                };
+                if exact && coherence == 0 {
+                    zero_nearest = Some(indices.clone());
+                }
+                (indices, None, score)
+            } else {
+                let (indices, reconstructed) = mapper.map(reference, analysis, coherence);
+                let Some(score) = analysis.score_with_limits(&reconstructed, limits)? else {
+                    continue;
+                };
+                (indices, Some(reconstructed), score)
+            };
+            let fast_bytes = if use_strip {
+                palette::strip_price_indexed(
+                    &indices,
+                    &palette,
+                    reference.pixels.width(),
+                    reference.pixels.height(),
+                )?
+            } else {
+                let (fast_data, _) = palette::encode_for_reference_with(
+                    reference,
+                    &indices,
+                    &palette,
+                    reconstructed.as_ref(),
+                    true,
+                )?;
+                fast_data.len()
+            };
+            let id = if exact {
+                format!("png-exact-{colors}-coherence-{coherence}")
+            } else {
+                format!("png-{colors}-coherence-{coherence}")
+            };
+            top_trials.push(FastTrial {
+                fast_bytes,
+                id,
+                coherence,
+                exact,
+                indices,
+                reconstructed,
+                score,
+            });
+            top_trials.sort_by(|a, b| (a.fast_bytes, &a.id).cmp(&(b.fast_bytes, &b.id)));
+            top_trials.truncate(2);
+        }
+    }
+    if top_trials.is_empty() {
+        return Ok(None);
+    }
+    if let Some(best_known) = best_png_bytes {
+        let top_fast = if use_strip {
+            palette::encode_for_reference_with(
+                reference,
+                &top_trials[0].indices,
+                &palette,
+                top_trials[0].reconstructed.as_ref(),
+                true,
+            )?
+            .0
+            .len()
+        } else {
+            top_trials[0].fast_bytes
+        };
+        if top_fast > best_known.saturating_mul(2) {
+            return Ok(None);
+        }
+    }
+    let best_fast = top_trials[0].fast_bytes;
+    let threshold = best_fast + best_fast / 50; // within 2% of fast winner
+    let mut result: Option<Candidate> = None;
+    for (rank, trial) in top_trials.into_iter().enumerate() {
+        if rank > 0 && trial.fast_bytes > threshold {
+            break;
+        }
+        let (data, filter) = palette::encode_for_reference_with(
+            reference,
+            &trial.indices,
+            &palette,
+            trial.reconstructed.as_ref(),
+            false,
+        )?;
+        let c = Candidate {
+            id: trial.id,
+            parameters: Parameters::Png {
+                colors: palette.len(),
+                coherence: trial.coherence,
+                filter,
+                mapping: if trial.exact {
+                    "exact_cell_bounds"
+                } else {
+                    "cell_two_nearest"
+                },
+                palette_order: "as_generated",
+            },
+            bytes: data.len(),
+            data,
+            score: trial.score,
+        };
+        if result
+            .as_ref()
+            .is_none_or(|old| (c.bytes, &c.id) < (old.bytes, &old.id))
+        {
+            result = Some(c);
+        }
+    }
+    Ok(result)
 }
 
 /// Reorder only the winning filtered indexed PNG, retaining its exact pixels.
@@ -604,26 +647,53 @@ pub fn compress_with_budget(
                     crate::optimize::Shape::Detail,
                     crate::optimize::Shape::Spectrum,
                 ] {
-                    if let Some(c) = crate::jpeg_search::run_bounded(strength, |scale| {
-                        jpeg::candidate_prepared(
-                            &mut prepared,
-                            &reference,
-                            &analysis,
-                            shape,
-                            scale,
-                            limits,
-                        )
-                    })? {
+                    if let Some(c) = crate::jpeg_search::run_prepared(
+                        &mut prepared,
+                        strength,
+                        |p, scale| {
+                            jpeg::score_prepared(p, &reference, &analysis, shape, scale, limits)
+                        },
+                        |p, scale, score| {
+                            jpeg::encode_prepared(p, &reference, &analysis, shape, scale, score)
+                        },
+                    )? {
                         candidates.push(c);
                     }
                 }
             }
         } else {
+            let limits = strength.limits();
+            let hist = palette::Histogram::new(&reference, &analysis);
+            let mut best_png_bytes = Some(source.len());
+            if let Some(mut c) = run_job(&reference, &analysis, Job::PngLossless, strength)? {
+                preserve_png_density(source, &mut c)?;
+                best_png_bytes = best_png_bytes.map(|b| b.min(c.bytes));
+                candidates.push(c);
+            }
             for job in crate::optimize::jobs(reference.source_format)? {
-                if let Some(mut c) = run_job(&reference, &analysis, job, strength)? {
+                if let Job::Png { colors } = job
+                    && let Some(mut c) = run_png_palette_job(
+                        &reference,
+                        &analysis,
+                        &hist,
+                        colors,
+                        limits,
+                        best_png_bytes,
+                    )?
+                {
                     preserve_png_density(source, &mut c)?;
+                    best_png_bytes = best_png_bytes.map(|b| b.min(c.bytes));
                     candidates.push(c);
                 }
+            }
+            if let Some(mut c) = predictive::search_bounded_with_target(
+                &reference,
+                &analysis,
+                limits,
+                best_png_bytes,
+            )? {
+                preserve_png_density(source, &mut c)?;
+                candidates.push(c);
             }
         }
     }

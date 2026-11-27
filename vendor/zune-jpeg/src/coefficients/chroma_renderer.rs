@@ -215,6 +215,42 @@ impl ChromaRenderer {
         Ok(())
     }
 
+    /// Replace one retained raw Cb/Cr block with its candidate IDCT and save
+    /// the previous 8x8 samples into `saved` so a rejected paired trial can
+    /// restore them without re-running IDCT.
+    pub fn swap_block(
+        &mut self,
+        component: usize,
+        block_x: usize,
+        block_y: usize,
+        coeff: &[i16; 64],
+        saved: &mut [i16; 64],
+    ) -> Result<(), DecodeErrors> {
+        let samples = self.prepare_block(component, block_x, block_y, coeff)?;
+        for row in 0..8 {
+            let start = (block_y * 8 + row) * self.chroma_stride + block_x * 8;
+            let dst = &mut self.planes[component][start..start + 8];
+            saved[row * 8..row * 8 + 8].copy_from_slice(dst);
+            dst.copy_from_slice(&samples[row * 8..row * 8 + 8]);
+        }
+        Ok(())
+    }
+
+    /// Restore an 8x8 raw Cb/Cr block previously saved by `swap_block`.
+    pub fn restore_block(
+        &mut self,
+        component: usize,
+        block_x: usize,
+        block_y: usize,
+        saved: &[i16; 64],
+    ) {
+        for row in 0..8 {
+            let start = (block_y * 8 + row) * self.chroma_stride + block_x * 8;
+            self.planes[component][start..start + 8]
+                .copy_from_slice(&saved[row * 8..row * 8 + 8]);
+        }
+    }
+
     fn prepare_block(
         &self,
         component: usize,
@@ -312,15 +348,63 @@ impl ChromaRenderer {
         let mut cb = [0; 16];
         let mut cr = [0; 16];
         let mut rgb = [0; 48];
+        if self.h == 1 && self.v == 1 {
+            if let Some(c) = candidate {
+                if left == c.left && top == c.top && width <= 8 && height <= 8 {
+                    let y_plane = &self.planes[0];
+                    let cb_plane = &self.planes[1];
+                    let cr_plane = &self.planes[2];
+                    for row in 0..height {
+                        let py = top + row;
+                        let y_off = py * self.stride + left;
+                        let c_off = py * self.chroma_stride + left;
+                        let s_off = row * 8;
+                        y[..width].copy_from_slice(&y_plane[y_off..y_off + width]);
+                        if c.component == 1 {
+                            cb[..width].copy_from_slice(&c.samples[s_off..s_off + width]);
+                            cr[..width].copy_from_slice(&cr_plane[c_off..c_off + width]);
+                        } else {
+                            cb[..width].copy_from_slice(&cb_plane[c_off..c_off + width]);
+                            cr[..width].copy_from_slice(&c.samples[s_off..s_off + width]);
+                        }
+                        (self.rgb)(&y, &cb, &cr, &mut rgb, &mut 0);
+                        let start = row * width * 3;
+                        out[start..start + width * 3].copy_from_slice(&rgb[..width * 3]);
+                    }
+                    return;
+                }
+            }
+            let y_plane = &self.planes[0];
+            let cb_plane = &self.planes[1];
+            let cr_plane = &self.planes[2];
+            for row in 0..height {
+                let py = top + row;
+                let y_row = py * self.stride + left;
+                let c_row = py * self.chroma_stride + left;
+                for col in (0..width).step_by(16) {
+                    let lanes = (width - col).min(16);
+                    y[..lanes].copy_from_slice(&y_plane[y_row + col..y_row + col + lanes]);
+                    cb[..lanes].copy_from_slice(&cb_plane[c_row + col..c_row + col + lanes]);
+                    cr[..lanes].copy_from_slice(&cr_plane[c_row + col..c_row + col + lanes]);
+                    (self.rgb)(&y, &cb, &cr, &mut rgb, &mut 0);
+                    let start = (row * width + col) * 3;
+                    out[start..start + lanes * 3].copy_from_slice(&rgb[..lanes * 3]);
+                }
+            }
+            return;
+        }
+        let cand_cb = candidate.filter(|c| c.component == 1);
+        let cand_cr = candidate.filter(|c| c.component == 2);
         for row in 0..height {
+            let py = top + row;
+            let y_row = py * self.stride + left;
             for col in (0..width).step_by(16) {
                 let lanes = (width - col).min(16);
+                y[..lanes].copy_from_slice(&self.planes[0][y_row + col..y_row + col + lanes]);
                 for lane in 0..lanes {
                     let px = left + col + lane;
-                    let py = top + row;
-                    y[lane] = self.planes[0][py * self.stride + px];
-                    cb[lane] = self.chroma_sample(1, px, py, candidate);
-                    cr[lane] = self.chroma_sample(2, px, py, candidate);
+                    cb[lane] = self.chroma_sample(1, px, py, cand_cb);
+                    cr[lane] = self.chroma_sample(2, px, py, cand_cr);
                 }
                 // Conversion is lane-independent; unused lanes stay on stack.
                 (self.rgb)(&y, &cb, &cr, &mut rgb, &mut 0);

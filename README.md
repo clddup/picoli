@@ -80,6 +80,10 @@ cargo test --workspace
 - `crates/picoli-wasm`：WebAssembly 接口。
 - `vendor`：带本地补丁的第三方依赖及其许可证。
 
-PNG 和 JPEG 编码复用现有库，PNG 无损重压缩使用 libdeflate。第三方许可与修改说明随源码保留。
+PNG 和 JPEG 编码复用现有库，PNG 无损重压缩使用 libdeflate。
+
+## 许可证
+
+Picoli 采用 [GNU GPL v3.0](LICENSE)（`GPL-3.0-only`）。第三方依赖保留各自的许可证，详见 `vendor` 中的许可文件和修改说明。
 
 This software is based in part on the work of the Independent JPEG Group.

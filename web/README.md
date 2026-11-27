@@ -2,6 +2,19 @@
 
 Picoli 通过 WebAssembly 在本地处理图片。构建步骤见项目 [README](../README.md#webassembly)。生成的模块位于 `web/pkg`，需要通过 HTTP 服务加载，而不是直接打开本地 HTML 文件。
 
+## 运行 Demo
+
+先按项目 README 构建 WASM 和绑定，然后在仓库根目录执行：
+
+```sh
+node scripts/build-site.mjs
+python3 -I -m http.server 8080 --bind 127.0.0.1 --directory dist
+```
+
+访问 `http://127.0.0.1:8080`。页面支持拖放与批量选择、强度调整、原图／结果分界对比、原尺寸查看和单张／ZIP 下载。图片仅在本地 Worker 中处理，不发送到服务器。
+
+部署由 `.github/workflows/pages.yml` 管理。每次 `main` 更新后，Actions 从同一提交构建核心和页面，将静态产物写入 `gh-pages`，再通过官方 Pages Action 部署。不要手工修改 `gh-pages`；页面底部的提交号指向实际构建版本。
+
 ## 压缩接口
 
 在 `web` 目录的 JavaScript 模块中加载绑定：
@@ -29,7 +42,9 @@ export async function compress(file) {
 
 压缩接口是同步的，建议放入 Dedicated Web Worker，避免阻塞页面。当前没有进度回调或协作取消接口；需要取消时终止 Worker。
 
-`worker.js` 是基线编码的消息协议示例，支持 `capabilities` 和 `baseline-encode`，尚未接入完整压缩接口。使用完整压缩时，在自己的 Worker 中调用 `compress_experimental`，并通过可转移的 `ArrayBuffer` 传递输入和输出。
+Demo 使用 `engine-client.js` 和 `compress-worker.js` 调用完整压缩接口，通过可转移的 `ArrayBuffer` 传递输入和输出。文件依次处理，每张完成后释放 Worker；停止操作会直接终止当前 Worker，清空队列也会释放预览 URL。页面显示真实的文件级状态，不显示虚构的百分比进度。
+
+`worker.js` 保留为旧的基线编码协议示例，支持 `capabilities` 和 `baseline-encode`，不是 Demo 使用的压缩入口。
 
 ## Node 验证
 

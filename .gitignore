@@ -1,10 +1,12 @@
 # Build output
 **/target/
 /web/pkg/
+/dist/
 
 # Local images and experiment output
 /artifacts/
 /output/
+/.playwright-cli/
 /samples/
 
 # Local research records

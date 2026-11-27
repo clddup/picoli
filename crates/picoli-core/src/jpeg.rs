@@ -222,6 +222,157 @@ pub(crate) fn candidate(
         .ok_or_else(|| Error::Encoding("unbounded JPEG candidate unexpectedly rejected".into()))
 }
 
+pub(crate) struct PreparedSampling {
+    sampling: u16,
+    fdct: jpeg_encoder::PreparedFdct,
+    coeffs: [Vec<i16>; 3],
+}
+
+impl PreparedSampling {
+    pub(crate) fn new(reference: &Reference, sampling: u16) -> Result<Self, Error> {
+        if reference.alpha.is_some() {
+            return Err(Error::Unsupported(
+                "JPEG cannot preserve transparency without an explicit matte",
+            ));
+        }
+        let width = u16::try_from(reference.pixels.width())
+            .map_err(|_| Error::Limit("JPEG width exceeds 65535"))?;
+        let height = u16::try_from(reference.pixels.height())
+            .map_err(|_| Error::Limit("JPEG height exceeds 65535"))?;
+        let factor = match sampling {
+            444 => SamplingFactor::R_4_4_4,
+            422 => SamplingFactor::R_4_2_2,
+            420 => SamplingFactor::R_4_2_0,
+            _ => return Err(Error::Argument("JPEG sampling must be 444/422/420")),
+        };
+        let fdct = jpeg_encoder::PreparedFdct::new(
+            reference.pixels.as_raw(),
+            width,
+            height,
+            factor,
+            ChromaSubsamplingMethod::Average,
+        )
+        .map_err(|e| Error::Encoding(e.to_string()))?;
+        Ok(Self {
+            sampling,
+            fdct,
+            coeffs: [Vec::new(), Vec::new(), Vec::new()],
+        })
+    }
+}
+
+pub(crate) fn candidate_prepared(
+    prepared: &mut PreparedSampling,
+    reference: &Reference,
+    analysis: &Analysis,
+    shape: Shape,
+    scale: u16,
+    limits: crate::quality::Limits,
+) -> Result<Option<Candidate>, Error> {
+    let Some(context) = crate::analysis::opaque::OpaqueContext::new(analysis, limits) else {
+        return candidate_bounded(reference, analysis, shape, prepared.sampling, scale, limits);
+    };
+    let (luma, chroma) = tables(analysis, shape, scale);
+    prepared
+        .fdct
+        .quantize_into(&luma, &chroma, &mut prepared.coeffs);
+
+    let mut scorer = context.start();
+    let mut pixel_index = 0usize;
+    let accepted = zune_jpeg::stream_reconstruct_progressive(
+        prepared.fdct.width,
+        prepared.fdct.height,
+        prepared.fdct.h_max as u8,
+        prepared.fdct.v_max as u8,
+        &luma,
+        &chroma,
+        [
+            &prepared.coeffs[0],
+            &prepared.coeffs[1],
+            &prepared.coeffs[2],
+        ],
+        |row_rgb| {
+            for p in row_rgb.chunks_exact(3) {
+                if !scorer.push_rgb(pixel_index, [p[0], p[1], p[2]]) {
+                    return false;
+                }
+                pixel_index += 1;
+            }
+            true
+        },
+    )
+    .map_err(|e| Error::InvalidJpeg(e.to_string()))?;
+    if !accepted {
+        return Ok(None);
+    }
+    let score = scorer.finish();
+    debug_assert_eq!(
+        pixel_index,
+        usize::from(prepared.fdct.width) * usize::from(prepared.fdct.height)
+    );
+
+    let components = [
+        jpeg_encoder::QuantizedComponent {
+            horizontal_sampling_factor: prepared.fdct.components[0].h_sample,
+            vertical_sampling_factor: prepared.fdct.components[0].v_sample,
+            quantization_table: &luma,
+            block_width: prepared.fdct.components[0].block_width,
+            block_height: prepared.fdct.components[0].block_height,
+            coefficients: &prepared.coeffs[0],
+        },
+        jpeg_encoder::QuantizedComponent {
+            horizontal_sampling_factor: prepared.fdct.components[1].h_sample,
+            vertical_sampling_factor: prepared.fdct.components[1].v_sample,
+            quantization_table: &chroma,
+            block_width: prepared.fdct.components[1].block_width,
+            block_height: prepared.fdct.components[1].block_height,
+            coefficients: &prepared.coeffs[1],
+        },
+        jpeg_encoder::QuantizedComponent {
+            horizontal_sampling_factor: prepared.fdct.components[2].h_sample,
+            vertical_sampling_factor: prepared.fdct.components[2].v_sample,
+            quantization_table: &chroma,
+            block_width: prepared.fdct.components[2].block_width,
+            block_height: prepared.fdct.components[2].block_height,
+            coefficients: &prepared.coeffs[2],
+        },
+    ];
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder::new(&mut bytes, 100);
+    encoder.set_progressive_scans(4);
+    encoder.set_optimized_huffman_tables(true);
+    encoder.set_progressive_eob_runs(false);
+    encoder.set_progressive_scan_huffman(false);
+    let data = match encoder.encode_quantized(jpeg_encoder::QuantizedImage {
+        width: prepared.fdct.width,
+        height: prepared.fdct.height,
+        color_type: jpeg_encoder::JpegColorType::Ycbcr,
+        components: &components,
+    }) {
+        Ok(()) => reference.jpeg_metadata.attach(bytes)?,
+        // Rare 8-bit DQT/category overflows fall back to the full encoder path.
+        Err(_) => encode(reference, analysis, shape, prepared.sampling, scale)?,
+    };
+
+    Ok(Some(Candidate {
+        id: format!("jpeg-{shape:?}-{}-scale{scale}", prepared.sampling),
+        bytes: data.len(),
+        data,
+        score,
+        parameters: Parameters::Jpeg {
+            shape,
+            sampling: prepared.sampling,
+            quantization_scale: scale,
+            scans_per_component: 4,
+            eob_runs: false,
+            scan_huffman: false,
+            coefficient_rdo_lambda: 0,
+            quantization_margin_percent: 100,
+            coefficient_rdo_sampling_weights: false,
+        },
+    }))
+}
+
 pub(crate) fn candidate_bounded(
     reference: &Reference,
     analysis: &Analysis,
@@ -332,6 +483,77 @@ mod tests {
                 crate::decode_baseline(&bytes).unwrap().pixels.dimensions(),
                 (33, 17)
             );
+        }
+    }
+
+    #[test]
+    fn prepared_sampling_matches_candidate_bounded_bit_for_bit() {
+        for (width, height) in [(1, 1), (7, 19), (17, 13), (35, 17)] {
+            let reference = Reference {
+                pixels: image::RgbImage::from_fn(width, height, |x, y| {
+                    image::Rgb([
+                        ((x * 73 + y * 29) % 256) as u8,
+                        ((x * 41 + y * 97) % 256) as u8,
+                        ((x * 17 + y * 53 + 120) % 256) as u8,
+                    ])
+                }),
+                alpha: None,
+                source_format: "jpeg",
+                jpeg_metadata: Default::default(),
+            };
+            let analysis = Analysis::new(&reference.pixels).unwrap();
+            let high_limits = crate::quality::Strength::new(95).unwrap().limits();
+            let strict_limits = crate::quality::Strength::new(20).unwrap().limits();
+            for sampling in [444, 422, 420] {
+                let mut prepared = PreparedSampling::new(&reference, sampling).unwrap();
+                for shape in [Shape::Standard, Shape::Detail, Shape::Spectrum] {
+                    for limits in [high_limits, strict_limits] {
+                        for scale in [25, 80, 200] {
+                            let actual = candidate_prepared(
+                                &mut prepared,
+                                &reference,
+                                &analysis,
+                                shape,
+                                scale,
+                                limits,
+                            )
+                            .unwrap();
+                            let expected = candidate_bounded(
+                                &reference, &analysis, shape, sampling, scale, limits,
+                            )
+                            .unwrap();
+                            match (actual, expected) {
+                                (None, None) => {}
+                                (Some(a), Some(e)) => {
+                                    assert_eq!(a.id, e.id);
+                                    assert_eq!(
+                                        format!("{:?}", a.parameters),
+                                        format!("{:?}", e.parameters)
+                                    );
+                                    assert_eq!(a.data, e.data);
+                                    assert_eq!(
+                                        a.score.weighted_pixel_error.to_bits(),
+                                        e.score.weighted_pixel_error.to_bits()
+                                    );
+                                    assert_eq!(
+                                        a.score.weighted_edge_error.to_bits(),
+                                        e.score.weighted_edge_error.to_bits()
+                                    );
+                                    assert_eq!(
+                                        a.score.worst_tile_error.to_bits(),
+                                        e.score.worst_tile_error.to_bits()
+                                    );
+                                }
+                                (a, e) => panic!(
+                                    "mismatch for {width}x{height} sampling={sampling} {shape:?} scale={scale}: actual={} expected={}",
+                                    a.is_some(),
+                                    e.is_some()
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

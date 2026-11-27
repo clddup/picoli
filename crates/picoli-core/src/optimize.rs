@@ -112,12 +112,12 @@ pub fn jobs(format: &str) -> Result<Vec<Job>, Error> {
                     .map(|colors| Job::Png { colors }),
             )
             .collect()),
-        "jpeg" => Ok([Shape::Standard, Shape::Detail, Shape::Spectrum]
+        "jpeg" => Ok([444u16, 422, 420]
             .into_iter()
-            .flat_map(|shape| {
-                [444, 422, 420]
+            .flat_map(|sampling| {
+                [Shape::Standard, Shape::Detail, Shape::Spectrum]
                     .into_iter()
-                    .map(move |sampling| Job::Jpeg { shape, sampling })
+                    .map(move |shape| Job::Jpeg { shape, sampling })
             })
             .collect()),
         _ => Err(Error::Argument("format must be jpeg or png")),

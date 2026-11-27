@@ -58,6 +58,11 @@ pub(crate) struct OpaqueScorer<'a> {
 }
 
 impl OpaqueScorer<'_> {
+    #[inline]
+    pub(crate) fn push_rgb(&mut self, index: usize, rgb: [u8; 3]) -> bool {
+        self.push(index, super::color(rgb))
+    }
+
     pub(crate) fn push(&mut self, index: usize, candidate: [i32; 3]) -> bool {
         let width = self.analysis.dimensions.0 as usize;
         let height = self.analysis.dimensions.1 as usize;

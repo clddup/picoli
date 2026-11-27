@@ -1,11 +1,179 @@
 //! Experimental standard-JPEG coefficient input. No RGB round trip or FDCT.
 use super::{
-    AlignedBlock, Encoder, EncodingError, JfifWrite, JpegColorType, Marker, QuantizationTable,
-    QuantizationTableType, SamplingFactor, ZIGZAG,
+    AlignedBlock, ChromaSubsamplingMethod, DefaultOperations, Encoder, EncodingError, ImageBuffer,
+    JfifWrite, JpegColorType, Marker, Operations, QuantizationTable, QuantizationTableType,
+    RgbImage, SamplingFactor, ZIGZAG, get_block, get_block_averaged,
 };
 use alloc::{boxed::Box, vec::Vec};
 mod rate_model;
 pub use rate_model::CoefficientRateModel;
+
+/// Precomputed natural-order FDCT blocks for one RGB image and sampling layout.
+/// Avoids repeating RGB->YCbCr, chroma averaging and FDCT across table searches.
+pub struct PreparedFdct {
+    pub width: u16,
+    pub height: u16,
+    pub sampling_factor: SamplingFactor,
+    pub h_max: usize,
+    pub v_max: usize,
+    pub mcu_x: usize,
+    pub mcu_y: usize,
+    pub components: [PreparedFdctComponent; 3],
+}
+
+pub struct PreparedFdctComponent {
+    pub h_sample: u8,
+    pub v_sample: u8,
+    pub cols: usize,
+    pub rows: usize,
+    pub block_width: usize,
+    pub block_height: usize,
+    pub blocks: Vec<AlignedBlock>,
+}
+
+impl PreparedFdct {
+    pub fn new(
+        rgb: &[u8],
+        width: u16,
+        height: u16,
+        sampling_factor: SamplingFactor,
+        chroma_subsampling_method: ChromaSubsamplingMethod,
+    ) -> Result<Self, EncodingError> {
+        let required = usize::from(width) * usize::from(height) * 3;
+        if width == 0 || height == 0 {
+            return Err(EncodingError::ZeroImageDimensions { width, height });
+        }
+        if rgb.len() < required {
+            return Err(EncodingError::BadImageData {
+                length: rgb.len(),
+                required,
+            });
+        }
+        if !matches!(
+            sampling_factor,
+            SamplingFactor::R_4_4_4
+                | SamplingFactor::R_4_2_2
+                | SamplingFactor::R_4_2_0
+                | SamplingFactor::F_1_1
+                | SamplingFactor::F_2_1
+                | SamplingFactor::F_2_2
+        ) {
+            return Err(EncodingError::InvalidConfiguration(
+                "PreparedFdct supports 444/422/420 sampling only",
+            ));
+        }
+        let image = RgbImage(rgb, width, height);
+        let (h_u8, v_u8) = sampling_factor.get_sampling_factors();
+        let (max_h, max_v) = (usize::from(h_u8), usize::from(v_u8));
+        let mcu_x = usize::from(width).div_ceil(8 * max_h);
+        let mcu_y = usize::from(height).div_ceil(8 * max_v);
+        let padded_cols = mcu_x * max_h;
+        let padded_rows = mcu_y * max_v;
+        let buffer_width = padded_cols * 8;
+        let buffer_size = padded_cols * padded_rows * 64;
+
+        let mut row = [
+            Vec::with_capacity(buffer_size),
+            Vec::with_capacity(buffer_size),
+            Vec::with_capacity(buffer_size),
+            Vec::new(),
+        ];
+        for y in 0..padded_rows * 8 {
+            let clamped_y = (y.min(usize::from(height) - 1)) as u16;
+            image.fill_buffers(clamped_y, &mut row);
+            for _ in usize::from(width)..buffer_width {
+                for channel in &mut row[..3] {
+                    channel.push(channel[channel.len() - 1]);
+                }
+            }
+        }
+
+        let num_cols = usize::from(width).div_ceil(8);
+        let num_rows = usize::from(height).div_ceil(8);
+        let specs = [(h_u8, v_u8), (1, 1), (1, 1)];
+        let mut components: [Option<PreparedFdctComponent>; 3] = [None, None, None];
+        for (i, &(hs, vs)) in specs.iter().enumerate() {
+            let h_scale = max_h / usize::from(hs);
+            let v_scale = max_v / usize::from(vs);
+            let cols = num_cols.div_ceil(h_scale);
+            let rows = num_rows.div_ceil(v_scale);
+            let block_width = mcu_x * usize::from(hs);
+            let block_height = mcu_y * usize::from(vs);
+            let average = chroma_subsampling_method == ChromaSubsamplingMethod::Average
+                && (h_scale > 1 || v_scale > 1);
+            let mut blocks = Vec::with_capacity(cols * rows);
+            for block_y in 0..rows {
+                for block_x in 0..cols {
+                    let bx = block_x * 8 * h_scale;
+                    let by = block_y * 8 * v_scale;
+                    let mut block = if average {
+                        get_block_averaged(&row[i], bx, by, h_scale, v_scale, buffer_width)
+                    } else {
+                        get_block(&row[i], bx, by, h_scale, v_scale, buffer_width)
+                    };
+                    DefaultOperations::fdct(&mut block);
+                    blocks.push(block);
+                }
+            }
+            components[i] = Some(PreparedFdctComponent {
+                h_sample: hs,
+                v_sample: vs,
+                cols,
+                rows,
+                block_width,
+                block_height,
+                blocks,
+            });
+        }
+        let [c0, c1, c2] = components;
+        Ok(Self {
+            width,
+            height,
+            sampling_factor,
+            h_max: max_h,
+            v_max: max_v,
+            mcu_x,
+            mcu_y,
+            components: [c0.unwrap(), c1.unwrap(), c2.unwrap()],
+        })
+    }
+
+    pub fn quantize_into(
+        &self,
+        luma: &[u16; 64],
+        chroma: &[u16; 64],
+        out: &mut [Vec<i16>; 3],
+    ) {
+        let q_tables = [
+            QuantizationTable::new_with_quality(
+                &QuantizationTableType::Custom(Box::new(*luma)),
+                100,
+                true,
+            ),
+            QuantizationTable::new_with_quality(
+                &QuantizationTableType::Custom(Box::new(*chroma)),
+                100,
+                false,
+            ),
+        ];
+        for (i, comp) in self.components.iter().enumerate() {
+            let table = &q_tables[usize::from(i > 0)];
+            let total = comp.block_width * comp.block_height * 64;
+            out[i].clear();
+            out[i].resize(total, 0);
+            for by in 0..comp.rows {
+                for bx in 0..comp.cols {
+                    let src = &comp.blocks[by * comp.cols + bx].data;
+                    let dst_off = (by * comp.block_width + bx) * 64;
+                    let dst = &mut out[i][dst_off..dst_off + 64];
+                    for z in 0..64 {
+                        dst[z] = table.quantize(src[z], z);
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Borrowed quantized coefficients in NATURAL order, 64 values per block.
 /// Padding blocks may be present; only the actual image data-unit grid is coded.

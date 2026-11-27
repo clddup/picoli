@@ -102,24 +102,13 @@ pub fn run_job(
     }
     let limits = strength.limits();
     match job {
-        Job::Jpeg { shape, sampling } => crate::jpeg_search::run_bounded(strength, |scale| {
-            jpeg::candidate_bounded(reference, analysis, shape, sampling, scale, limits)
-        }),
-        Job::PngPredictive => {
-            let mut result: Option<Candidate> = None;
-            for &step in predictive::steps(reference) {
-                if let Some(candidate) =
-                    predictive::candidate(reference, analysis, step, |score| limits.accepts(score))?
-                    && result.as_ref().is_none_or(|old| {
-                        best([old, &candidate].into_iter(), strength)
-                            .is_some_and(|winner| std::ptr::eq(winner, &candidate))
-                    })
-                {
-                    result = Some(candidate);
-                }
-            }
-            Ok(result)
+        Job::Jpeg { shape, sampling } => {
+            let mut prepared = jpeg::PreparedSampling::new(reference, sampling)?;
+            crate::jpeg_search::run_bounded(strength, |scale| {
+                jpeg::candidate_prepared(&mut prepared, reference, analysis, shape, scale, limits)
+            })
         }
+        Job::PngPredictive => predictive::search_bounded(reference, analysis, limits),
         Job::PngLossless => {
             let data = crate::encode_png_lossless(reference)?;
             Ok(Some(Candidate {
@@ -140,7 +129,16 @@ pub fn run_job(
             } else {
                 None
             };
-            let mut result: Option<Candidate> = None;
+            struct FastTrial {
+                fast_bytes: usize,
+                id: String,
+                coherence: u32,
+                exact: bool,
+                indices: Vec<u8>,
+                reconstructed: Option<image::RgbImage>,
+                score: Score,
+            }
+            let mut top_trials: Vec<FastTrial> = Vec::with_capacity(3);
             for exact in [false, true] {
                 // Keep the original mapping candidates as controls. The exact
                 // mode targets dense palettes, where two guesses can miss.
@@ -148,51 +146,104 @@ pub fn run_job(
                     continue;
                 }
                 let mut mapper = palette::Mapper::new(reference, &palette, exact);
-                for coherence in [0, 64, 256, 1024, 2048, 4096, 8192] {
-                    let mapped = if let Some(context) = &opaque {
-                        mapper.map_scored(reference, analysis, coherence, context)
+                let mut exact_nearest: Option<Vec<u8>> = None;
+                let coherences: &[u32] = if palette.len() <= 1 {
+                    &[0]
+                } else {
+                    &[0, 64, 256, 1024, 2048, 4096, 8192]
+                };
+                for &coherence in coherences {
+                    let (indices, reconstructed, score) = if let Some(context) = &opaque {
+                        let nearest_ref = if exact && coherence > 0 {
+                            exact_nearest.as_deref()
+                        } else {
+                            None
+                        };
+                        let Some((indices, score)) = mapper.map_scored_indices(
+                            reference,
+                            analysis,
+                            coherence,
+                            nearest_ref,
+                            context,
+                        ) else {
+                            continue;
+                        };
+                        if exact && coherence == 0 {
+                            exact_nearest = Some(indices.clone());
+                        }
+                        (indices, None, score)
                     } else {
                         let (indices, reconstructed) = mapper.map(reference, analysis, coherence);
-                        analysis
-                            .score_with_limits(&reconstructed, limits)?
-                            .map(|score| (indices, reconstructed, score))
+                        let Some(score) = analysis.score_with_limits(&reconstructed, limits)?
+                        else {
+                            continue;
+                        };
+                        (indices, Some(reconstructed), score)
                     };
-                    let Some((indices, reconstructed, score)) = mapped else {
-                        continue;
-                    };
-                    let (data, filter) = palette::encode_for_reference(
+                    let (fast_data, _) = palette::encode_for_reference_with(
                         reference,
                         &indices,
                         &palette,
-                        &reconstructed,
+                        reconstructed.as_ref(),
+                        true,
                     )?;
-                    let c = Candidate {
-                        id: if exact {
-                            format!("png-exact-{colors}-coherence-{coherence}")
-                        } else {
-                            format!("png-{colors}-coherence-{coherence}")
-                        },
-                        parameters: Parameters::Png {
-                            colors: palette.len(),
-                            coherence,
-                            filter,
-                            mapping: if exact {
-                                "exact_cell_bounds"
-                            } else {
-                                "cell_two_nearest"
-                            },
-                            palette_order: "as_generated",
-                        },
-                        bytes: data.len(),
-                        data,
-                        score,
+                    let id = if exact {
+                        format!("png-exact-{colors}-coherence-{coherence}")
+                    } else {
+                        format!("png-{colors}-coherence-{coherence}")
                     };
-                    if result
-                        .as_ref()
-                        .is_none_or(|old| (c.bytes, &c.id) < (old.bytes, &old.id))
-                    {
-                        result = Some(c);
-                    }
+                    top_trials.push(FastTrial {
+                        fast_bytes: fast_data.len(),
+                        id,
+                        coherence,
+                        exact,
+                        indices,
+                        reconstructed,
+                        score,
+                    });
+                    top_trials.sort_by(|a, b| (a.fast_bytes, &a.id).cmp(&(b.fast_bytes, &b.id)));
+                    top_trials.truncate(2);
+                }
+            }
+            if top_trials.is_empty() {
+                return Ok(None);
+            }
+            let best_fast = top_trials[0].fast_bytes;
+            let threshold = best_fast + best_fast / 50; // within 2% of fast winner
+            let mut result: Option<Candidate> = None;
+            for (rank, trial) in top_trials.into_iter().enumerate() {
+                if rank > 0 && trial.fast_bytes > threshold {
+                    break;
+                }
+                let (data, filter) = palette::encode_for_reference_with(
+                    reference,
+                    &trial.indices,
+                    &palette,
+                    trial.reconstructed.as_ref(),
+                    false,
+                )?;
+                let c = Candidate {
+                    id: trial.id,
+                    parameters: Parameters::Png {
+                        colors: palette.len(),
+                        coherence: trial.coherence,
+                        filter,
+                        mapping: if trial.exact {
+                            "exact_cell_bounds"
+                        } else {
+                            "cell_two_nearest"
+                        },
+                        palette_order: "as_generated",
+                    },
+                    bytes: data.len(),
+                    data,
+                    score: trial.score,
+                };
+                if result
+                    .as_ref()
+                    .is_none_or(|old| (c.bytes, &c.id) < (old.bytes, &old.id))
+                {
+                    result = Some(c);
                 }
             }
             Ok(result)
@@ -544,10 +595,35 @@ pub fn compress_with_budget(
     let analysis = Analysis::for_reference(&reference, memory_budget_bytes)?;
     let mut candidates = vec![original(&reference, &analysis, source)?];
     if strength.percent() > 0 {
-        for job in crate::optimize::jobs(reference.source_format)? {
-            if let Some(mut c) = run_job(&reference, &analysis, job, strength)? {
-                preserve_png_density(source, &mut c)?;
-                candidates.push(c);
+        if reference.source_format == "jpeg" {
+            let limits = strength.limits();
+            for sampling in [444u16, 422, 420] {
+                let mut prepared = jpeg::PreparedSampling::new(&reference, sampling)?;
+                for shape in [
+                    crate::optimize::Shape::Standard,
+                    crate::optimize::Shape::Detail,
+                    crate::optimize::Shape::Spectrum,
+                ] {
+                    if let Some(c) = crate::jpeg_search::run_bounded(strength, |scale| {
+                        jpeg::candidate_prepared(
+                            &mut prepared,
+                            &reference,
+                            &analysis,
+                            shape,
+                            scale,
+                            limits,
+                        )
+                    })? {
+                        candidates.push(c);
+                    }
+                }
+            }
+        } else {
+            for job in crate::optimize::jobs(reference.source_format)? {
+                if let Some(mut c) = run_job(&reference, &analysis, job, strength)? {
+                    preserve_png_density(source, &mut c)?;
+                    candidates.push(c);
+                }
             }
         }
     }

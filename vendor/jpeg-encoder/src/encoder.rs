@@ -12,7 +12,9 @@ use alloc::vec::Vec;
 mod coefficient_input;
 mod optimized_scan;
 #[cfg(feature = "experimental-coefficients")]
-pub use coefficient_input::{CoefficientRateModel, QuantizedComponent, QuantizedImage};
+pub use coefficient_input::{
+    CoefficientRateModel, PreparedFdct, PreparedFdctComponent, QuantizedComponent, QuantizedImage,
+};
 #[cfg(feature = "experimental-coefficients")]
 pub use optimized_scan::ScanOptimizationReport;
 

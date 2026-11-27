@@ -50,32 +50,44 @@ fn map(reference: &Reference, step: u8) -> Result<RgbImage, Error> {
         return Err(Error::Argument("alpha dimensions differ from RGB"));
     }
     let source = &reference.pixels;
-    let mut mapped = RgbImage::new(source.width(), source.height());
+    let width = source.width() as usize;
+    let height = source.height() as usize;
+    let stride = width * 3;
+    let src_raw = source.as_raw();
+    let alpha_raw = reference.alpha.as_ref().map(|a| a.as_raw().as_slice());
+    let mut dst_raw = vec![0u8; src_raw.len()];
     let step = i16::from(step);
-    for y in 0..source.height() {
-        for x in 0..source.width() {
-            let original = source.get_pixel(x, y);
-            if reference.alpha.as_ref().is_some_and(|a| a[(x, y)][0] == 0) {
-                mapped.put_pixel(x, y, *original);
+    for y in 0..height {
+        let row_off = y * stride;
+        let prev_off = row_off.saturating_sub(stride);
+        for x in 0..width {
+            let p_idx = y * width + x;
+            let px = row_off + x * 3;
+            if alpha_raw.is_some_and(|a| a[p_idx] == 0) {
+                dst_raw[px..px + 3].copy_from_slice(&src_raw[px..px + 3]);
                 continue;
             }
-            let channels = std::array::from_fn(|c| {
-                let left = if x > 0 { mapped[(x - 1, y)][c] } else { 0 };
-                let up = if y > 0 { mapped[(x, y - 1)][c] } else { 0 };
+            for c in 0..3 {
+                let left = if x > 0 { dst_raw[px - 3 + c] } else { 0 };
+                let up = if y > 0 {
+                    dst_raw[prev_off + x * 3 + c]
+                } else {
+                    0
+                };
                 let upper_left = if x > 0 && y > 0 {
-                    mapped[(x - 1, y - 1)][c]
+                    dst_raw[prev_off + (x - 1) * 3 + c]
                 } else {
                     0
                 };
                 let predicted = paeth(left, up, upper_left);
-                let residual = i16::from(original[c]) - predicted;
+                let residual = i16::from(src_raw[px + c]) - predicted;
                 let quantized = residual.signum() * ((residual.abs() + step / 2) / step) * step;
-                (predicted + quantized).clamp(0, 255) as u8
-            });
-            mapped.put_pixel(x, y, image::Rgb(channels));
+                dst_raw[px + c] = (predicted + quantized).clamp(0, 255) as u8;
+            }
         }
     }
-    Ok(mapped)
+    RgbImage::from_raw(source.width(), source.height(), dst_raw)
+        .ok_or(Error::Encoding("predictive RGB buffer mismatch".into()))
 }
 
 pub(crate) fn candidate(
@@ -97,6 +109,55 @@ pub(crate) fn candidate(
         data,
         score,
     }))
+}
+
+pub(crate) fn search_bounded(
+    reference: &Reference,
+    analysis: &Analysis,
+    limits: crate::quality::Limits,
+) -> Result<Option<Candidate>, Error> {
+    let steps = steps(reference);
+    let mut top: Vec<(usize, u8, RgbImage, Score)> = Vec::with_capacity(3);
+    for &step in steps {
+        let mapped = map(reference, step)?;
+        let Some(score) = analysis.score_with_limits(&mapped, limits)? else {
+            continue;
+        };
+        let (fast_data, _) = palette::encode_truecolor_with(reference, &mapped, true)?;
+        top.push((fast_data.len(), step, mapped, score));
+        top.sort_by_key(|t| (t.0, t.1));
+        top.truncate(2);
+    }
+    if top.is_empty() {
+        return Ok(None);
+    }
+    let best_fast = top[0].0;
+    let threshold = best_fast + best_fast / 50;
+    let mut best: Option<Candidate> = None;
+    for (rank, (fast_bytes, step, mapped, score)) in top.into_iter().enumerate() {
+        if rank > 0 && fast_bytes > threshold {
+            break;
+        }
+        let (data, filter) = palette::encode_truecolor(reference, &mapped)?;
+        let candidate = Candidate {
+            id: format!("png-predictive-step-{step}"),
+            parameters: Parameters::PngPredictive { step, filter },
+            bytes: data.len(),
+            data,
+            score,
+        };
+        if best.as_ref().is_none_or(|old| {
+            candidate
+                .bytes
+                .cmp(&old.bytes)
+                .then(candidate.score.loss.total_cmp(&old.score.loss))
+                .then(candidate.id.cmp(&old.id))
+                .is_lt()
+        }) {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
 }
 
 #[cfg(test)]

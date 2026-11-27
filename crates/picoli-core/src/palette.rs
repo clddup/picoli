@@ -244,10 +244,13 @@ impl<'a> Mapper<'a> {
         analysis: &Analysis,
         coherence: u32,
     ) -> (Vec<u8>, RgbImage) {
-        self.map_impl(reference, analysis, coherence, |_, _| true)
-            .expect("unbounded mapping cannot reject a pixel")
+        let (indices, rgb) = self
+            .map_impl(reference, analysis, coherence, None, true, |_, _| true)
+            .expect("unbounded mapping cannot reject a pixel");
+        (indices, rgb.expect("rgb requested"))
     }
 
+    #[cfg(test)]
     pub(crate) fn map_scored(
         &mut self,
         reference: &Reference,
@@ -257,10 +260,32 @@ impl<'a> Mapper<'a> {
     ) -> Option<(Vec<u8>, RgbImage, crate::analysis::Score)> {
         debug_assert!(reference.alpha.is_none());
         let mut scorer = context.start();
-        let (indices, rgb) = self.map_impl(reference, analysis, coherence, |i, value| {
-            scorer.push(i, value)
-        })?;
-        Some((indices, rgb, scorer.finish()))
+        let (indices, rgb) =
+            self.map_impl(reference, analysis, coherence, None, true, |i, value| {
+                scorer.push(i, value)
+            })?;
+        Some((indices, rgb.expect("rgb requested"), scorer.finish()))
+    }
+
+    pub(crate) fn map_scored_indices(
+        &mut self,
+        reference: &Reference,
+        analysis: &Analysis,
+        coherence: u32,
+        nearest_indices: Option<&[u8]>,
+        context: &crate::analysis::opaque::OpaqueContext<'_>,
+    ) -> Option<(Vec<u8>, crate::analysis::Score)> {
+        debug_assert!(reference.alpha.is_none());
+        let mut scorer = context.start();
+        let (indices, _) = self.map_impl(
+            reference,
+            analysis,
+            coherence,
+            nearest_indices,
+            false,
+            |i, value| scorer.push(i, value),
+        )?;
+        Some((indices, scorer.finish()))
     }
 
     fn map_impl(
@@ -268,21 +293,34 @@ impl<'a> Mapper<'a> {
         reference: &Reference,
         analysis: &Analysis,
         coherence: u32,
+        nearest_indices: Option<&[u8]>,
+        build_rgb: bool,
         mut accept: impl FnMut(usize, [i32; 3]) -> bool,
-    ) -> Option<(Vec<u8>, RgbImage)> {
+    ) -> Option<(Vec<u8>, Option<RgbImage>)> {
         let width = reference.pixels.width() as usize;
-        let mut indices = Vec::with_capacity(analysis.colors.len());
-        let mut rgb = RgbImage::new(reference.pixels.width(), reference.pixels.height());
+        let len = analysis.colors.len();
+        // Start small when early-rejection scoring can abort on the first tile row.
+        let mut indices = Vec::with_capacity((width * 16).min(len));
+        let mut rgb =
+            build_rgb.then(|| RgbImage::new(reference.pixels.width(), reference.pixels.height()));
         for (i, pixel) in reference.pixels.pixels().enumerate() {
             let left = if i % width > 0 { indices[i - 1] } else { 0 };
             let up = if i >= width { indices[i - width] } else { 0 };
             let weight = u64::from(analysis.weights[i]);
-            let mut mask = self.masks[key(pixel.0)];
-            if !self.nearest_cache.is_empty() {
-                let index = self.nearest(pixel.0, analysis.colors.at(i), mask);
-                mask = [0; 4];
-                mask[usize::from(index) / 64] = 1 << (index % 64);
-            }
+            let mut mask = if let Some(nearest) = nearest_indices {
+                let index = nearest[i];
+                let mut m = [0u64; 4];
+                m[usize::from(index) / 64] = 1 << (index % 64);
+                m
+            } else {
+                let mut m = self.masks[key(pixel.0)];
+                if !self.nearest_cache.is_empty() {
+                    let index = self.nearest(pixel.0, analysis.colors.at(i), m);
+                    m = [0; 4];
+                    m[usize::from(index) / 64] = 1 << (index % 64);
+                }
+                m
+            };
             if i % width > 0 {
                 mask[usize::from(left) / 64] |= 1 << (left % 64);
             }
@@ -308,12 +346,14 @@ impl<'a> Mapper<'a> {
             }
             let chosen = best.1;
             indices.push(chosen);
-            let mapped = if reference.alpha.as_ref().is_some_and(|a| a.as_raw()[i] == 0) {
-                *pixel // Preserve invisible RGB, independent of the mapped index.
-            } else {
-                image::Rgb(self.palette[usize::from(chosen)])
-            };
-            rgb.put_pixel((i % width) as u32, (i / width) as u32, mapped);
+            if let Some(rgb) = rgb.as_mut() {
+                let mapped = if reference.alpha.as_ref().is_some_and(|a| a.as_raw()[i] == 0) {
+                    *pixel // Preserve invisible RGB, independent of the mapped index.
+                } else {
+                    image::Rgb(self.palette[usize::from(chosen)])
+                };
+                rgb.put_pixel((i % width) as u32, (i / width) as u32, mapped);
+            }
             if !accept(i, self.values[usize::from(chosen)]) {
                 return None;
             }
@@ -331,6 +371,7 @@ pub(crate) fn map(
     Mapper::new(reference, palette, false).map(reference, analysis, coherence)
 }
 
+#[cfg(test)]
 pub(crate) fn encode(
     indices: &[u8],
     palette: &[[u8; 3]],
@@ -346,17 +387,36 @@ pub(crate) fn encode_for_reference(
     palette: &[[u8; 3]],
     mapped: &RgbImage,
 ) -> Result<(Vec<u8>, &'static str), Error> {
+    encode_for_reference_with(reference, indices, palette, Some(mapped), false)
+}
+
+pub(crate) fn encode_for_reference_with(
+    reference: &Reference,
+    indices: &[u8],
+    palette: &[[u8; 3]],
+    mapped: Option<&RgbImage>,
+    fast: bool,
+) -> Result<(Vec<u8>, &'static str), Error> {
     let Some(alpha) = &reference.alpha else {
-        return encode(indices, palette, mapped.width(), mapped.height());
+        return encode_indexed_with(
+            indices,
+            palette,
+            &[],
+            reference.pixels.width(),
+            reference.pixels.height(),
+            fast,
+        );
     };
+    let mapped = mapped.ok_or(Error::Argument("missing mapped RGB for transparent PNG"))?;
     let rgba = mapped_rgba(reference, mapped, alpha)?;
-    let mut best = encode_data(
+    let mut best = encode_data_with(
         rgba.as_raw(),
         rgba.width(),
         rgba.height(),
         png::BitDepth::Eight,
         png::ColorType::Rgba,
         None,
+        fast,
     )?;
     let mut lookup = std::collections::BTreeMap::new();
     let mut colors = Vec::new();
@@ -380,12 +440,13 @@ pub(crate) fn encode_for_reference(
     while transparencies.last() == Some(&255) {
         transparencies.pop();
     }
-    let indexed = encode_indexed(
+    let indexed = encode_indexed_with(
         &remapped,
         &colors,
         &transparencies,
         rgba.width(),
         rgba.height(),
+        fast,
     )?;
     if indexed.0.len() < best.0.len() {
         best = indexed;
@@ -422,27 +483,37 @@ pub(crate) fn encode_truecolor(
     reference: &Reference,
     mapped: &RgbImage,
 ) -> Result<(Vec<u8>, &'static str), Error> {
+    encode_truecolor_with(reference, mapped, false)
+}
+
+pub(crate) fn encode_truecolor_with(
+    reference: &Reference,
+    mapped: &RgbImage,
+    fast: bool,
+) -> Result<(Vec<u8>, &'static str), Error> {
     if mapped.dimensions() != reference.pixels.dimensions() {
         return Err(Error::Argument("mapped dimensions differ from reference"));
     }
     if let Some(alpha) = &reference.alpha {
         let rgba = mapped_rgba(reference, mapped, alpha)?;
-        encode_data(
+        encode_data_with(
             rgba.as_raw(),
             rgba.width(),
             rgba.height(),
             png::BitDepth::Eight,
             png::ColorType::Rgba,
             None,
+            fast,
         )
     } else {
-        encode_data(
+        encode_data_with(
             mapped.as_raw(),
             mapped.width(),
             mapped.height(),
             png::BitDepth::Eight,
             png::ColorType::Rgb,
             None,
+            fast,
         )
     }
 }
@@ -454,6 +525,17 @@ pub(crate) fn encode_indexed(
     width: u32,
     height: u32,
 ) -> Result<(Vec<u8>, &'static str), Error> {
+    encode_indexed_with(indices, palette, transparencies, width, height, false)
+}
+
+fn encode_indexed_with(
+    indices: &[u8],
+    palette: &[[u8; 3]],
+    transparencies: &[u8],
+    width: u32,
+    height: u32,
+    fast: bool,
+) -> Result<(Vec<u8>, &'static str), Error> {
     let (bits, depth) = match palette.len() {
         1..=2 => (1, png::BitDepth::One),
         3..=4 => (2, png::BitDepth::Two),
@@ -461,20 +543,32 @@ pub(crate) fn encode_indexed(
         17..=256 => (8, png::BitDepth::Eight),
         _ => return Err(Error::Argument("palette must have 1..=256 entries")),
     };
+    let colors: Vec<u8> = palette.iter().flatten().copied().collect();
+    if bits == 8 {
+        return encode_data_with(
+            indices,
+            width,
+            height,
+            depth,
+            png::ColorType::Indexed,
+            Some((&colors, transparencies)),
+            fast,
+        );
+    }
     let stride = (width as usize * bits).div_ceil(8);
     let mut packed = vec![0u8; stride * height as usize];
     for (i, &index) in indices.iter().enumerate() {
         let (x, y) = (i % width as usize, i / width as usize);
         packed[y * stride + x * bits / 8] |= index << (8 - bits - (x * bits) % 8);
     }
-    let colors: Vec<u8> = palette.iter().flatten().copied().collect();
-    encode_data(
+    encode_data_with(
         &packed,
         width,
         height,
         depth,
         png::ColorType::Indexed,
         Some((&colors, transparencies)),
+        fast,
     )
 }
 
@@ -556,27 +650,33 @@ const FILTERS: [(png::Filter, &str); 5] = [
     (png::Filter::Adaptive, "adaptive"),
 ];
 
-fn encode_with_filter(
-    data: &[u8],
+#[derive(Clone, Copy)]
+struct PngLayout<'a> {
     width: u32,
     height: u32,
     depth: png::BitDepth,
     color_type: png::ColorType,
-    indexed: IndexedData<'_>,
+    indexed: IndexedData<'a>,
+}
+
+fn encode_with_filter(
+    data: &[u8],
+    layout: PngLayout<'_>,
     filter: png::Filter,
+    level: u8,
 ) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut bytes, width, height);
-        encoder.set_depth(depth);
-        encoder.set_color(color_type);
-        if let Some((colors, transparencies)) = indexed {
+        let mut encoder = png::Encoder::new(&mut bytes, layout.width, layout.height);
+        encoder.set_depth(layout.depth);
+        encoder.set_color(layout.color_type);
+        if let Some((colors, transparencies)) = layout.indexed {
             encoder.set_palette(colors);
             if !transparencies.is_empty() {
                 encoder.set_trns(transparencies);
             }
         }
-        encoder.set_deflate_compression(png::DeflateCompression::Level(9));
+        encoder.set_deflate_compression(png::DeflateCompression::Level(level));
         encoder.set_filter(filter);
         let mut writer = encoder
             .write_header()
@@ -591,6 +691,25 @@ fn encode_with_filter(
     Ok(bytes)
 }
 
+fn best_filtered(
+    data: &[u8],
+    layout: PngLayout<'_>,
+    selected: [bool; 5],
+    level: u8,
+) -> Result<(Vec<u8>, &'static str), Error> {
+    let mut best: Option<(Vec<u8>, &'static str)> = None;
+    for (index, &(filter, name)) in FILTERS.iter().enumerate() {
+        if !selected[index] {
+            continue;
+        }
+        let bytes = encode_with_filter(data, layout, filter, level)?;
+        if best.as_ref().is_none_or(|b| bytes.len() < b.0.len()) {
+            best = Some((bytes, name));
+        }
+    }
+    best.ok_or(Error::Encoding("no PNG filter candidates".into()))
+}
+
 fn encode_data(
     data: &[u8],
     width: u32,
@@ -599,41 +718,75 @@ fn encode_data(
     color_type: png::ColorType,
     indexed: IndexedData<'_>,
 ) -> Result<(Vec<u8>, &'static str), Error> {
+    encode_data_with(data, width, height, depth, color_type, indexed, false)
+}
+
+fn encode_data_with(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    depth: png::BitDepth,
+    color_type: png::ColorType,
+    indexed: IndexedData<'_>,
+    fast: bool,
+) -> Result<(Vec<u8>, &'static str), Error> {
+    let layout = PngLayout {
+        width,
+        height,
+        depth,
+        color_type,
+        indexed,
+    };
     let mut selected = [true; 5];
-    if color_type == png::ColorType::Rgb && height >= 192 && data.len() >= 65536 {
-        // Rank RGB filters on first/middle/last row strips. Palette, alpha and
-        // grayscale retain exhaustive search: sample rankings can miss their
-        // full-image winner. This heuristic changes no reconstructed samples.
+    let use_preview = height >= 192
+        && data.len() >= 65536
+        && (color_type == png::ColorType::Rgb || (fast && data.len() >= 262_144));
+    if use_preview {
+        // Rank filters on first/middle/last row strips. Fast search uses level 1;
+        // final level-9 keeps level-9 on the 48-row preview to preserve filter ranking.
+        let preview_level = if fast { 1 } else { 9 };
         let stride = data.len() / height as usize;
         let mut preview = Vec::with_capacity(stride * 48);
         for start in [0, (height as usize - 16) / 2, height as usize - 16] {
             preview.extend_from_slice(&data[start * stride..(start + 16) * stride]);
         }
+        let preview_layout = PngLayout {
+            height: 48,
+            ..layout
+        };
         let mut ranked = Vec::with_capacity(FILTERS.len());
         for (index, &(filter, _)) in FILTERS.iter().enumerate() {
-            let bytes =
-                encode_with_filter(&preview, width, 48, depth, color_type, indexed, filter)?;
+            let bytes = encode_with_filter(&preview, preview_layout, filter, preview_level)?;
             ranked.push((bytes.len(), index));
         }
         ranked.sort_unstable();
         selected.fill(false);
         for (rank, &(bytes, index)) in ranked.iter().enumerate() {
-            // Retain at least two, and all filters within 1% of the best
-            // preview so near-ties do not become arbitrary exclusions.
-            selected[index] = rank < 2 || bytes <= ranked[0].0 + ranked[0].0 / 100;
+            selected[index] = if fast {
+                rank == 0
+            } else {
+                rank < 2 || bytes <= ranked[0].0 + ranked[0].0 / 100
+            };
         }
     }
-    let mut best: Option<(Vec<u8>, &'static str)> = None;
-    for (index, &(filter, name)) in FILTERS.iter().enumerate() {
-        if !selected[index] {
-            continue;
+    if fast {
+        return best_filtered(data, layout, selected, 1);
+    }
+    // For very large non-preview final encodes, rank all 5 filters on level 4
+    // first so level 9 only runs on the top 2 (+2% ties).
+    if !use_preview && data.len() >= 512 * 1024 {
+        let mut ranked = Vec::with_capacity(FILTERS.len());
+        for (index, &(filter, _)) in FILTERS.iter().enumerate() {
+            let bytes = encode_with_filter(data, layout, filter, 4)?;
+            ranked.push((bytes.len(), index));
         }
-        let bytes = encode_with_filter(data, width, height, depth, color_type, indexed, filter)?;
-        if best.as_ref().is_none_or(|b| bytes.len() < b.0.len()) {
-            best = Some((bytes, name));
+        ranked.sort_unstable();
+        selected.fill(false);
+        for (rank, &(bytes, index)) in ranked.iter().enumerate() {
+            selected[index] = rank < 2 || bytes <= ranked[0].0 + ranked[0].0 / 50;
         }
     }
-    best.ok_or(Error::Encoding("no PNG filter candidates".into()))
+    best_filtered(data, layout, selected, 9)
 }
 
 #[cfg(test)]
@@ -775,6 +928,86 @@ mod mapping_tests {
             crate::resources::DEFAULT_MEMORY_BYTES,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn scored_indices_with_reused_nearest_match_full_map_and_score() {
+        let reference = Reference {
+            pixels: RgbImage::from_fn(37, 19, |x, y| image::Rgb(random_rgb(x + y * 37))),
+            alpha: None,
+            source_format: "png",
+            jpeg_metadata: Default::default(),
+        };
+        let analysis = Analysis::new(&reference.pixels).unwrap();
+        let high_limits = crate::quality::Limits {
+            pixel: 1e12,
+            edge: 1e12,
+            tile: 1e12,
+        };
+        let strict_limits = crate::quality::Limits {
+            pixel: 1.0,
+            edge: 1.0,
+            tile: 1.0,
+        };
+        let high_ctx = crate::analysis::opaque::OpaqueContext::new(&analysis, high_limits).unwrap();
+        let strict_ctx =
+            crate::analysis::opaque::OpaqueContext::new(&analysis, strict_limits).unwrap();
+        for count in [1, 64, 256] {
+            let palette: Vec<_> = (0..count).map(|n| random_rgb(n + 2222)).collect();
+            let (nearest, nearest_score) = Mapper::new(&reference, &palette, true)
+                .map_scored_indices(&reference, &analysis, 0, None, &high_ctx)
+                .unwrap();
+            let (expected_zero, expected_rgb) =
+                Mapper::new(&reference, &palette, true).map(&reference, &analysis, 0);
+            assert_eq!(nearest, expected_zero);
+            assert_eq!(
+                nearest_score.weighted_pixel_error.to_bits(),
+                analysis
+                    .score(&expected_rgb)
+                    .unwrap()
+                    .weighted_pixel_error
+                    .to_bits()
+            );
+
+            for coherence in [0u32, 64, 256, 1024, 2048, 4096, 8192] {
+                let (actual_indices, actual_score) = Mapper::new(&reference, &palette, true)
+                    .map_scored_indices(&reference, &analysis, coherence, Some(&nearest), &high_ctx)
+                    .unwrap();
+                let (expected_indices, expected_rgb) =
+                    Mapper::new(&reference, &palette, true).map(&reference, &analysis, coherence);
+                let expected_score = analysis.score(&expected_rgb).unwrap();
+                assert_eq!(
+                    actual_indices, expected_indices,
+                    "palette={count}, coherence={coherence}"
+                );
+                assert_eq!(
+                    actual_score.weighted_pixel_error.to_bits(),
+                    expected_score.weighted_pixel_error.to_bits()
+                );
+                assert_eq!(
+                    actual_score.weighted_edge_error.to_bits(),
+                    expected_score.weighted_edge_error.to_bits()
+                );
+                assert_eq!(
+                    actual_score.worst_tile_error.to_bits(),
+                    expected_score.worst_tile_error.to_bits()
+                );
+
+                let strict_actual = Mapper::new(&reference, &palette, true)
+                    .map_scored_indices(
+                        &reference,
+                        &analysis,
+                        coherence,
+                        Some(&nearest),
+                        &strict_ctx,
+                    )
+                    .map(|(_, s)| s);
+                let strict_expected = analysis
+                    .score_with_limits(&expected_rgb, strict_limits)
+                    .unwrap();
+                assert_eq!(strict_actual.is_some(), strict_expected.is_some());
+            }
+        }
     }
 }
 

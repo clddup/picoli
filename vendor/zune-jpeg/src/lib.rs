@@ -170,7 +170,10 @@ extern crate core;
 pub use zune_core;
 
 #[cfg(feature = "experimental-coefficients")]
-pub use crate::coefficients::{ChromaRenderer, LumaRenderer, QuantizedCoefficients, QuantizedComponent};
+pub use crate::coefficients::{
+    ChromaRenderer, LumaRenderer, QuantizedCoefficients, QuantizedComponent,
+    stream_reconstruct_progressive,
+};
 #[cfg(feature = "experimental-coefficients")]
 mod coefficients;
 pub use crate::components::SampleRatios;

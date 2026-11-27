@@ -1,0 +1,21 @@
+# Build output
+**/target/
+/web/pkg/
+
+# Local images and experiment output
+/artifacts/
+/output/
+/samples/
+
+# Local research records
+/docs/architecture.md
+/docs/acceptance.md
+/docs/roadmap.md
+/docs/validation.md
+/config/acceptance.json
+
+# Local configuration
+.env
+.env.*
+!.env.example
+.DS_Store

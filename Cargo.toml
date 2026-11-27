@@ -1,0 +1,40 @@
+[workspace]
+members = ["crates/picoli-core", "crates/picoli-cli", "crates/picoli-wasm"]
+exclude = ["vendor/zune-jpeg", "vendor/jpeg-encoder"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+picoli-core = { path = "crates/picoli-core" }
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.11"
+rayon = "1.11"
+wasm-bindgen = "=0.2.117"
+zune-core = "=0.5.3"
+zune-jpeg = { version = "=0.5.15", default-features = false, features = ["std"] }
+jpeg-encoder = { version = "=0.7.1", default-features = false, features = ["std"] }
+png = "=0.18.1"
+sysinfo = { version = "=0.38.4", default-features = false, features = ["system"] }
+
+[patch.crates-io]
+zune-jpeg = { path = "vendor/zune-jpeg" }
+jpeg-encoder = { path = "vendor/jpeg-encoder" }
+libdeflater = { path = "vendor/libdeflater" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = true
+strip = true

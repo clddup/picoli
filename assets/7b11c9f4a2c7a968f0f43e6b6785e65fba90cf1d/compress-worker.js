@@ -8,8 +8,8 @@ self.onmessage = async ({ data }) => {
     self.postMessage({ type: 'phase', phase: 'loading' });
     await init();
     self.postMessage({ type: 'phase', phase: 'compressing' });
-    // Omitted memory argument retains the shared core's default 128 MiB budget.
-    const encoded = compress_experimental(new Uint8Array(data.input), data.strength);
+    // Budget is chosen explicitly in the UI; omission keeps the core's default 128 MiB.
+    const encoded = compress_experimental(new Uint8Array(data.input), data.strength, data.memoryMiB);
     const buffer = encoded.byteOffset === 0 && encoded.byteLength === encoded.buffer.byteLength
       ? encoded.buffer : encoded.slice().buffer;
     self.postMessage({ type: 'result', buffer, milliseconds: performance.now() - start }, [buffer]);

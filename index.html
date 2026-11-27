@@ -7,14 +7,14 @@
   <meta name="description" content="Picoli 图片压缩工作台。JPG、PNG 在浏览器本地处理，保留格式、尺寸与透明度。">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
   <title>Picoli · 本地图像压缩终端</title>
-  <link rel="icon" href="./assets/574dbad03d9242c1ba90e1d6b6842813bb643008/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="./assets/574dbad03d9242c1ba90e1d6b6842813bb643008/styles.css">
-  <script type="module" src="./assets/574dbad03d9242c1ba90e1d6b6842813bb643008/app.js"></script>
+  <link rel="icon" href="./assets/7b11c9f4a2c7a968f0f43e6b6785e65fba90cf1d/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./assets/7b11c9f4a2c7a968f0f43e6b6785e65fba90cf1d/styles.css">
+  <script type="module" src="./assets/7b11c9f4a2c7a968f0f43e6b6785e65fba90cf1d/app.js"></script>
 </head>
 <body>
   <div class="ambient-grid" aria-hidden="true"></div>
   <header class="site-header">
-    <a class="brand" href="./" aria-label="Picoli 首页"><img src="./assets/574dbad03d9242c1ba90e1d6b6842813bb643008/favicon.svg" width="36" height="36" alt=""><span>PICOLI<span class="brand-dot">_</span></span></a>
+    <a class="brand" href="./" aria-label="Picoli 首页"><img src="./assets/7b11c9f4a2c7a968f0f43e6b6785e65fba90cf1d/favicon.svg" width="36" height="36" alt=""><span>PICOLI<span class="brand-dot">_</span></span></a>
     <nav aria-label="主导航"><span class="nav-current"><span class="nav-dot"></span>图片工作台</span><a href="https://github.com/clddup/picoli" target="_blank" rel="noopener noreferrer">SOURCE CODE <span aria-hidden="true">↗</span></a></nav>
   </header>
   <main>
@@ -53,6 +53,8 @@
           <input id="strength" class="strength-range" type="range" min="0" max="100" value="50" step="1" aria-describedby="strength-hint">
           <div class="strength-labels"><span>更少改动</span><button id="reset-strength" class="text-button" type="button">默认 50</button><span>更小体积</span></div>
           <p id="strength-hint" class="setting-hint">数值越高，允许的失真越大。它不是画质保留百分比。</p>
+          <div class="memory-setting"><label for="memory">内存预算 <span>MEMORY</span></label><select id="memory" aria-describedby="memory-hint"><option value="128" selected>128 MiB · 默认</option><option value="256">256 MiB</option><option value="512">512 MiB</option><option value="1024">1024 MiB · 大图</option></select></div>
+          <p id="memory-hint" class="setting-hint" aria-live="polite">这是工作集估算预算，不是浏览器进程内存的硬上限。</p>
         </div>
         <div id="file-list" class="file-list" aria-label="图片队列"></div>
         <div id="empty-queue" class="empty-queue"><span class="terminal-prompt" aria-hidden="true">›</span><p>等待添加图片<span class="terminal-cursor" aria-hidden="true">_</span></p><span class="empty-line" aria-hidden="true"></span></div>

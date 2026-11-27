@@ -23,7 +23,8 @@ export function formatBytes(bytes) {
 /** Keep UI errors readable while callers retain the original diagnostic. */
 export function readableError(message) {
   if (/[㐀-鿿]/.test(message)) return message;
-  if (/memory|allocation|out of memory|budget/i.test(message)) return '图片超出当前处理预算，请尝试更小的图片。';
+  if (/budget/i.test(message)) return '当前内存预算不足，请调高“内存预算”后重试，或改用 CLI。';
+  if (/memory|allocation|out of memory/i.test(message)) return '设备可用内存不足，请关闭其他页面或改用 CLI，不要继续提高预算。';
   if (/unsupported|not supported|orientation|ICC|CMYK|bit.depth/i.test(message)) return '暂不支持这张图片的编码、色彩或方向配置。';
   if (/format error|decod|corrupt|truncat|unexpected|IHDR|invalid/i.test(message)) return '图片数据无法解码，文件可能损坏。';
   return '图片处理失败，请重试或换一张图片。';

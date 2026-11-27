@@ -63,7 +63,7 @@ wasm-bindgen target/wasm32-unknown-unknown/wasm-release/picoli_wasm.wasm \
   --target web --out-dir web/pkg
 ```
 
-`compress_experimental(input, strength_percent?, memory_mib?)` 接收图片字节并返回压缩后的字节，默认强度为 50，默认内存预算为 128 MiB。浏览器端建议在 Web Worker 中调用。详见 [浏览器接入](web/README.md)。
+`compress_experimental(input, strength_percent?, memory_mib?)` 接收图片字节并返回压缩后的字节，默认强度为 50；省略 `memory_mib` 时按图片自适应工作集预算。浏览器端建议在 Web Worker 中调用。详见 [浏览器接入](web/README.md)。
 
 ## 支持范围
 

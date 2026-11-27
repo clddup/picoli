@@ -14,9 +14,7 @@ python3 -I -m http.server 8080 --bind 127.0.0.1 --directory dist
 
 访问 `http://127.0.0.1:8080`。页面支持拖放与批量选择、强度调整、原图／结果分界对比、原尺寸查看和单张／ZIP 下载。图片仅在本地 Worker 中处理，不发送到服务器。
 
-页面默认使用自动内存预算，根据图片头信息和保留的元数据，在 128、256、512、1024 MiB 中选择满足工作集估算的最小档位。需要 512 MiB 及以上时，本批次会先请求一次确认；取消后不会开始压缩。仍可手动指定预算。
-
-自动预算不是设备空闲内存检测，也不是浏览器进程的硬上限。超过网页支持上限或实际内存分配失败时会停止处理，不会无限扩容重试；图片尺寸、Alpha 和压缩强度不受预算选择影响。
+页面完全自适应每张图片所需的内存工作集，单张顺序在独立 Web Worker 中处理并在完成后释放堆内存，无需手动选择内存预算，也不弹出确认框。图片尺寸、Alpha 和压缩强度不受内存适配影响；如果实际设备物理内存不足，Worker 会返回明确的错误提示，页面保持可操作。
 
 部署由 `.github/workflows/pages.yml` 管理。每次 `main` 更新后，Actions 从同一提交构建核心和页面，将静态产物写入 `gh-pages`，再通过官方 Pages Action 部署。不要手工修改 `gh-pages`；页面底部的提交号指向实际构建版本。
 
@@ -39,11 +37,11 @@ export async function compress(file) {
 
 - `input`：完整 JPG 或 PNG 文件字节。
 - `strength_percent`：可选整数 0–100，默认 50；0 原样返回。
-- `memory_mib`：可选整数 16–1024，默认 128。
+- `memory_mib`：可选整数（≥ 16）；省略时按图片头信息自动适配所需工作集，不设 1024 MiB 人为上限。
 
 输出保留输入格式和尺寸。内存不足或格式不支持时，接口抛出错误。内存预算用于估算工作集，不是浏览器进程的硬上限。
 
-`compression_memory_plan(input)` 仅检查图片头与支持的元数据，返回包含 `width`、`height`、`format`、`required_memory_bytes` 和 `memory_mib` 的 JSON 字符串。它不会解码完整像素或证明文件数据完整；实际压缩仍会执行完整校验。Demo 使用这个接口实现自动预算，底层压缩接口省略预算参数时仍保持 128 MiB。
+`compression_memory_plan(input)` 仅检查图片头与支持的元数据，返回包含 `width`、`height`、`format`、`required_memory_bytes` 和 `memory_mib` 的 JSON 字符串。它不会解码完整像素或证明文件数据完整；实际压缩仍会执行完整校验。
 
 ## Web Worker
 

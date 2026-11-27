@@ -2,21 +2,8 @@
 use crate::Error;
 use serde::Serialize;
 
-/// Conservative fallback for hosts without an available-memory API. Native CLI
-/// supplies its OS-derived budget; a WASM host can supply a larger tested budget.
+/// Conservative fallback for hosts that request the fixed baseline budget.
 pub const DEFAULT_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
-
-/// Automatic admission is capped, not a measurement of available physical RAM.
-pub const MAX_AUTOMATIC_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
-
-pub(crate) fn automatic_budget_error(error: Error) -> Error {
-    match error {
-        Error::Limit("estimated decode/analysis/search memory exceeds host budget") => {
-            Error::Limit("estimated memory exceeds automatic budget of 1024 MiB")
-        }
-        other => other,
-    }
-}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct CompressionMemoryPlan {
@@ -35,25 +22,18 @@ impl CompressionMemoryPlan {
         input_bytes: usize,
         metadata_bytes: usize,
     ) -> Result<Self, Error> {
-        let plan = Plan::with_metadata(
-            width,
-            height,
-            input_bytes,
-            metadata_bytes,
-            MAX_AUTOMATIC_MEMORY_BYTES,
-            1,
-        )
-        .map_err(automatic_budget_error)?;
+        let plan = Plan::with_metadata(width, height, input_bytes, metadata_bytes, u64::MAX, 1)?;
         let required_memory_bytes = plan
             .estimated_shared_bytes
             .checked_add(plan.estimated_worker_bytes)
             .ok_or(Error::Limit("working-set estimate overflow"))?;
-        let memory_mib = [128u32, 256, 512, 1024]
-            .into_iter()
-            .find(|&mib| required_memory_bytes <= u64::from(mib) * 1024 * 1024)
-            .ok_or(Error::Limit(
-                "estimated memory exceeds automatic budget of 1024 MiB",
-            ))?;
+        let mib = required_memory_bytes.div_ceil(1024 * 1024);
+        let tier = mib
+            .checked_next_power_of_two()
+            .ok_or(Error::Limit("working-set estimate overflow"))?
+            .max(128);
+        let memory_mib =
+            u32::try_from(tier).map_err(|_| Error::Limit("working-set estimate overflow"))?;
         Ok(Self {
             width,
             height,
@@ -61,6 +41,10 @@ impl CompressionMemoryPlan {
             required_memory_bytes,
             memory_mib,
         })
+    }
+
+    pub fn budget_bytes(self) -> Option<u64> {
+        u64::from(self.memory_mib).checked_mul(1024 * 1024)
     }
 }
 
@@ -136,7 +120,7 @@ impl Plan {
 mod tests {
     use super::*;
     #[test]
-    fn automatic_plan_uses_smallest_tier_and_keeps_default_128() {
+    fn automatic_plan_scales_adaptively_without_artificial_1024_cap() {
         assert_eq!(DEFAULT_MEMORY_BYTES, 128 * 1024 * 1024);
         assert_eq!(
             CompressionMemoryPlan::with_metadata(1, 1, "png", 100, 0)
@@ -144,8 +128,14 @@ mod tests {
                 .memory_mib,
             128
         );
-        for (width, tier) in [(2000, 128u32), (4000, 256), (9000, 512), (19000, 1024)] {
-            let base = Plan::new(width, 1000, 0, MAX_AUTOMATIC_MEMORY_BYTES, 1).unwrap();
+        for (width, tier) in [
+            (2000, 128u32),
+            (4000, 256),
+            (9000, 512),
+            (19000, 1024),
+            (38000, 2048),
+        ] {
+            let base = Plan::new(width, 1000, 0, u64::MAX, 1).unwrap();
             let input_bytes = ((u64::from(tier) * 1024 * 1024
                 - base.estimated_shared_bytes
                 - base.estimated_worker_bytes)
@@ -156,23 +146,22 @@ mod tests {
             assert_eq!(plan.required_memory_bytes, u64::from(tier) * 1024 * 1024);
             let above =
                 CompressionMemoryPlan::with_metadata(width, 1000, "png", input_bytes + 1, 0);
-            if tier == 1024 {
-                assert!(matches!(above, Err(Error::Limit(_))));
-            } else {
-                assert_eq!(above.unwrap().memory_mib, tier * 2);
-            }
+            assert_eq!(above.unwrap().memory_mib, tier * 2);
         }
     }
 
     #[test]
-    fn automatic_plan_covers_real_14mp_input_and_retained_metadata() {
+    fn automatic_plan_covers_real_high_res_inputs_and_retained_metadata() {
         let plan = CompressionMemoryPlan::with_metadata(4464, 3173, "png", 6_212_113, 0).unwrap();
         assert_eq!(plan.required_memory_bytes, 809_817_762);
         assert_eq!(plan.memory_mib, 1024);
+        let plan_25mp = CompressionMemoryPlan::with_metadata(5000, 5000, "png", 0, 0).unwrap();
+        assert_eq!(plan_25mp.memory_mib, 2048);
+        let plan_48mp = CompressionMemoryPlan::with_metadata(8064, 6048, "jpeg", 0, 0).unwrap();
+        assert_eq!(plan_48mp.memory_mib, 4096);
         let metadata =
             CompressionMemoryPlan::with_metadata(1000, 1000, "jpeg", 1000, 1024).unwrap();
-        let expected =
-            Plan::with_metadata(1000, 1000, 1000, 1024, MAX_AUTOMATIC_MEMORY_BYTES, 1).unwrap();
+        let expected = Plan::with_metadata(1000, 1000, 1000, 1024, u64::MAX, 1).unwrap();
         assert_eq!(
             metadata.required_memory_bytes,
             expected.estimated_shared_bytes + expected.estimated_worker_bytes
@@ -180,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_plan_rejects_zero_overflow_and_excess() {
+    fn automatic_plan_rejects_zero_and_overflow() {
         for (width, height) in [(0, 1), (1, 0)] {
             assert!(matches!(
                 CompressionMemoryPlan::with_metadata(width, height, "png", 0, 0),
@@ -189,7 +178,6 @@ mod tests {
         }
         for (width, height, input, metadata) in [
             (u32::MAX, u32::MAX, 0, 0),
-            (5000, 5000, 0, 0),
             (1, 1, usize::MAX, 0),
             (1, 1, 0, usize::MAX),
         ] {

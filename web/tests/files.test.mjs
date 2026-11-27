@@ -13,7 +13,7 @@ test('file type follows bytes, not extension or MIME', async () => {
 
 test('empty and oversized inputs fail before allocation', async () => {
   await assert.rejects(inspectFile(new File([], 'empty.png')), /空/);
-  await assert.rejects(inspectFile({ size: MAX_INPUT_BYTES + 1, slice() { throw new Error('must not read'); } }), /32 MiB/);
+  await assert.rejects(inspectFile({ size: MAX_INPUT_BYTES + 1, slice() { throw new Error('must not read'); } }), /256 MiB/);
 });
 
 test('filenames remain safe and reflect real format', () => {
@@ -35,9 +35,8 @@ test('byte and saving labels do not fabricate gains', () => {
 
 test('technical errors have readable UI descriptions without inventing success', () => {
   assert.match(readableError('Format error decoding Png: invalid IHDR'), /无法解码/);
-  assert.match(readableError('memory budget exceeded'), /预算/);
-  assert.match(readableError('memory budget exceeded'), /调高/);
-  assert.match(readableError('allocation failed: out of memory'), /不要继续提高预算/);
+  assert.match(readableError('memory budget exceeded'), /内存不足.*CLI/);
+  assert.match(readableError('allocation failed: out of memory'), /内存不足.*CLI/);
   assert.match(readableError('unsupported ICC profile'), /色彩/);
   assert.equal(readableError('这里只支持 JPG 和 PNG 图片。'), '这里只支持 JPG 和 PNG 图片。');
 });

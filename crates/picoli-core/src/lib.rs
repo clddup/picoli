@@ -38,7 +38,7 @@ use serde::Serialize;
 use std::io::Cursor;
 use thiserror::Error;
 
-pub const MAX_INPUT_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -113,12 +113,10 @@ pub fn decode_baseline(bytes: &[u8]) -> Result<Reference, Error> {
 /// validate the complete entropy stream. Compression still validates the input.
 ///
 /// # Errors
-/// Returns an error for unsupported/invalid headers, input over 32 MiB, or an
-/// estimate above the maximum automatic budget of 1024 MiB.
+/// Returns an error for unsupported/invalid headers, input over `MAX_INPUT_BYTES`,
+/// or arithmetic overflow in the working-set estimate.
 pub fn compression_memory_plan(bytes: &[u8]) -> Result<resources::CompressionMemoryPlan, Error> {
-    let (decoder, jpeg_metadata, source_format) =
-        baseline_decoder(bytes, resources::MAX_AUTOMATIC_MEMORY_BYTES)
-            .map_err(resources::automatic_budget_error)?;
+    let (decoder, jpeg_metadata, source_format) = baseline_decoder(bytes, u64::MAX)?;
     let (width, height) = decoder.dimensions();
     resources::CompressionMemoryPlan::with_metadata(
         width,
@@ -135,7 +133,7 @@ fn baseline_decoder(
     memory_budget_bytes: u64,
 ) -> Result<(impl ImageDecoder + '_, JpegMetadata, &'static str), Error> {
     if bytes.len() > MAX_INPUT_BYTES {
-        return Err(Error::Limit("encoded input > 32 MiB"));
+        return Err(Error::Limit("encoded input > 256 MiB"));
     }
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let format = reader
@@ -461,7 +459,7 @@ mod tests {
 
     #[test]
     fn memory_preflight_reads_png_headers_not_pixels() {
-        for (width, height, tier) in [(1, 1, 128), (4464, 3173, 1024)] {
+        for (width, height, tier) in [(1, 1, 128), (4464, 3173, 1024), (5000, 5000, 2048)] {
             let bytes = header_only_png(width, height, 8);
             let plan = compression_memory_plan(&bytes).unwrap();
             assert_eq!(
@@ -469,14 +467,7 @@ mod tests {
                 (width, height, "png")
             );
             assert_eq!(plan.memory_mib, tier);
-            let expected = resources::Plan::new(
-                width,
-                height,
-                bytes.len(),
-                resources::MAX_AUTOMATIC_MEMORY_BYTES,
-                1,
-            )
-            .unwrap();
+            let expected = resources::Plan::new(width, height, bytes.len(), u64::MAX, 1).unwrap();
             assert_eq!(
                 plan.required_memory_bytes,
                 expected.estimated_shared_bytes + expected.estimated_worker_bytes
@@ -495,12 +486,6 @@ mod tests {
         ));
         for (width, height, depth) in [(0, 1, 8), (1, 0, 8), (u32::MAX, u32::MAX, 8), (1, 1, 16)] {
             assert!(compression_memory_plan(&header_only_png(width, height, depth)).is_err());
-        }
-        let excess = compression_memory_plan(&header_only_png(5000, 5000, 8)).unwrap_err();
-        assert!(matches!(excess, Error::Limit(_)));
-        let message = excess.to_string();
-        for expected in ["automatic", "budget", "1024"] {
-            assert!(message.contains(expected), "{message}");
         }
         let mut bad_crc = header_only_png(1, 1, 8);
         bad_crc[29] ^= 1;
@@ -542,15 +527,9 @@ mod tests {
         let plan = compression_memory_plan(&bytes).unwrap();
         assert_eq!((plan.width, plan.height, plan.format), (16, 12, "jpeg"));
         assert_eq!(plan.memory_mib, 128);
-        let expected = resources::Plan::with_metadata(
-            16,
-            12,
-            bytes.len(),
-            payload.len() + 4,
-            resources::MAX_AUTOMATIC_MEMORY_BYTES,
-            1,
-        )
-        .unwrap();
+        let expected =
+            resources::Plan::with_metadata(16, 12, bytes.len(), payload.len() + 4, u64::MAX, 1)
+                .unwrap();
         assert_eq!(
             plan.required_memory_bytes,
             expected.estimated_shared_bytes + expected.estimated_worker_bytes

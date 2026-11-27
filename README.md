@@ -57,10 +57,16 @@ cargo install wasm-bindgen-cli --version 0.2.117 --locked
 
 ```sh
 CC_wasm32_unknown_unknown=clang AR_wasm32_unknown_unknown=llvm-ar \
+  CFLAGS_wasm32_unknown_unknown="-O3 -msimd128" \
+  RUSTFLAGS="-C target-feature=+simd128" \
   cargo build -p picoli-wasm --target wasm32-unknown-unknown --profile wasm-release
 
 wasm-bindgen target/wasm32-unknown-unknown/wasm-release/picoli_wasm.wasm \
   --target web --out-dir web/pkg
+
+wasm-opt -O3 --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int \
+  --enable-sign-ext --enable-mutable-globals --enable-multivalue --enable-reference-types \
+  web/pkg/picoli_wasm_bg.wasm -o web/pkg/picoli_wasm_bg.wasm
 ```
 
 `compress_experimental(input, strength_percent?, memory_mib?)` 接收图片字节并返回压缩后的字节，默认强度为 50；省略 `memory_mib` 时按图片自适应工作集预算。浏览器端建议在 Web Worker 中调用。详见 [浏览器接入](web/README.md)。

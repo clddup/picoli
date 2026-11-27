@@ -187,8 +187,12 @@ pub(crate) fn search_bounded_with_target(
     let pixels = reference.pixels.width() as usize * reference.pixels.height() as usize;
     let use_strip =
         reference.alpha.is_none() && pixels >= 1_048_576 && reference.pixels.height() >= 192;
-    let mut top: Vec<(usize, u8, RgbImage, Score)> = Vec::with_capacity(3);
-    for &step in steps {
+    let mut best_trial: Option<(usize, u8, RgbImage, Score)> = None;
+    let stop_at_first = pixels >= 1_048_576;
+    // Probe largest quantization step first. On large images stop at the largest
+    // accepted step; on smaller images evaluate all accepted steps so smooth
+    // gradients can still pick an aligned smaller step.
+    for &step in steps.iter().rev() {
         let (mapped, score) = if let Some(ctx) = &opaque {
             let mut scorer = ctx.start();
             let Some(mapped) = map_impl(reference, step, |i, rgb| scorer.push_rgb(i, rgb))? else {
@@ -208,54 +212,39 @@ pub(crate) fn search_bounded_with_target(
             let (fast_data, _) = palette::encode_truecolor_with(reference, &mapped, true)?;
             fast_data.len()
         };
-        top.push((rank_bytes, step, mapped, score));
-        top.sort_by_key(|t| (t.0, t.1));
-        top.truncate(2);
+        if best_trial
+            .as_ref()
+            .is_none_or(|old| (rank_bytes, step) < (old.0, old.1))
+        {
+            best_trial = Some((rank_bytes, step, mapped, score));
+        }
+        if stop_at_first {
+            break;
+        }
     }
-    if top.is_empty() {
+    let Some((rank_bytes, step, mapped, score)) = best_trial else {
         return Ok(None);
-    }
-    // If an already-finished PNG job beat predictive's best fast level-1 size
-    // by >2x, level-9 deflate cannot close a >2x gap.
+    };
     if let Some(best_known) = best_png_bytes {
-        let top_fast = if use_strip {
-            palette::encode_truecolor_with(reference, &top[0].2, true)?
-                .0
-                .len()
+        let estimated_fast = if use_strip {
+            rank_bytes
+                .saturating_mul(reference.pixels.height() as usize)
+                .div_ceil(128)
         } else {
-            top[0].0
+            rank_bytes
         };
-        if top_fast > best_known.saturating_mul(2) {
+        if estimated_fast > best_known.saturating_mul(2) {
             return Ok(None);
         }
     }
-    let best_fast = top[0].0;
-    let threshold = best_fast + best_fast / 50;
-    let mut best: Option<Candidate> = None;
-    for (rank, (fast_bytes, step, mapped, score)) in top.into_iter().enumerate() {
-        if rank > 0 && fast_bytes > threshold {
-            break;
-        }
-        let (data, filter) = palette::encode_truecolor(reference, &mapped)?;
-        let candidate = Candidate {
-            id: format!("png-predictive-step-{step}"),
-            parameters: Parameters::PngPredictive { step, filter },
-            bytes: data.len(),
-            data,
-            score,
-        };
-        if best.as_ref().is_none_or(|old| {
-            candidate
-                .bytes
-                .cmp(&old.bytes)
-                .then(candidate.score.loss.total_cmp(&old.score.loss))
-                .then(candidate.id.cmp(&old.id))
-                .is_lt()
-        }) {
-            best = Some(candidate);
-        }
-    }
-    Ok(best)
+    let (data, filter) = palette::encode_truecolor(reference, &mapped)?;
+    Ok(Some(Candidate {
+        id: format!("png-predictive-step-{step}"),
+        parameters: Parameters::PngPredictive { step, filter },
+        bytes: data.len(),
+        data,
+        score,
+    }))
 }
 
 #[cfg(test)]

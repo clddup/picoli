@@ -27,7 +27,7 @@ jobs:
       - name: Install WASM build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y clang llvm
+          sudo apt-get install --no-install-recommends -y clang llvm binaryen
           rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
           rustup default stable
       - name: Record compiler version
@@ -54,11 +54,14 @@ jobs:
         env:
           CC_wasm32_unknown_unknown: clang
           AR_wasm32_unknown_unknown: llvm-ar
+          CFLAGS_wasm32_unknown_unknown: -O3 -msimd128
+          RUSTFLAGS: -C target-feature=+simd128
         run: |
           # Cargo metadata also reads manifests outside the active target graph.
           cargo fetch --locked
           cargo build --locked -p picoli-wasm --target wasm32-unknown-unknown --profile wasm-release
           wasm-bindgen target/wasm32-unknown-unknown/wasm-release/picoli_wasm.wasm --target web --out-dir web/pkg
+          wasm-opt -O3 --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-multivalue --enable-reference-types web/pkg/picoli_wasm_bg.wasm -o web/pkg/picoli_wasm_bg.wasm
       - name: Check demo modules and tests
         run: |
           node --check scripts/build-site.mjs

@@ -108,7 +108,16 @@ pub(crate) struct Trial {
     pub data: Vec<u8>,
     pub zlib_bytes: usize,
 }
+#[cfg(test)]
 pub(crate) fn candidate(input: &[u8], budget: u64) -> Result<Option<Trial>, Error> {
+    candidate_with_level(input, budget, 12)
+}
+
+pub(crate) fn candidate_with_level(
+    input: &[u8],
+    budget: u64,
+    level_num: i32,
+) -> Result<Option<Trial>, Error> {
     let Some(parsed) = parse(input)? else {
         return Ok(None);
     };
@@ -121,7 +130,7 @@ pub(crate) fn candidate(input: &[u8], budget: u64) -> Result<Option<Trial>, Erro
     if filtered.len() != parsed.filtered_size {
         return Err(Error::Encoding("PNG filtered row length mismatch".into()));
     }
-    let level = libdeflater::CompressionLvl::new(12)
+    let level = libdeflater::CompressionLvl::new(level_num)
         .map_err(|e| Error::Encoding(format!("Invalid fixed deflate level: {e:?}")))?;
     let Some(mut compressor) = libdeflater::Compressor::try_new(level) else {
         return Ok(None);
@@ -196,6 +205,44 @@ pub(crate) fn refine(
     candidates: &mut Vec<Candidate>,
     strength: Strength,
 ) -> Result<(), Error> {
+    refine_impl(
+        source,
+        reference,
+        analysis,
+        candidates,
+        strength,
+        Some(12),
+        true,
+    )
+}
+
+pub(crate) fn refine_fast(
+    source: &[u8],
+    reference: &Reference,
+    analysis: &Analysis,
+    candidates: &mut Vec<Candidate>,
+    strength: Strength,
+) -> Result<(), Error> {
+    refine_impl(
+        source,
+        reference,
+        analysis,
+        candidates,
+        strength,
+        None,
+        cfg!(debug_assertions),
+    )
+}
+
+fn refine_impl(
+    source: &[u8],
+    reference: &Reference,
+    analysis: &Analysis,
+    candidates: &mut Vec<Candidate>,
+    strength: Strength,
+    fixed_level: Option<i32>,
+    verify_decode: bool,
+) -> Result<(), Error> {
     if strength.percent() == 0 || reference.source_format != "png" {
         return Ok(());
     }
@@ -216,18 +263,35 @@ pub(crate) fn refine(
     if !admitted(peak, analysis.memory_budget_bytes) {
         return Ok(());
     }
-    let Some(trial) = candidate(&winner.data, analysis.memory_budget_bytes)? else {
+    // Use level 12 on small/medium filtered payloads (fast enough at <=512 KiB
+    // and avoids level-10 regressions on repetitive graphics), and level 10
+    // (near-optimal parsing, ~3x faster than level 12) on larger payloads.
+    let level = match fixed_level {
+        Some(lvl) => lvl,
+        None => {
+            let parsed_len = parse(&winner.data)?.map_or(usize::MAX, |p| p.filtered_size);
+            if parsed_len <= 512 * 1024 { 12 } else { 10 }
+        }
+    };
+    let Some(trial) = candidate_with_level(&winner.data, analysis.memory_budget_bytes, level)?
+    else {
         return Ok(());
     };
     if trial.data.len() >= winner.bytes {
         return Ok(());
     }
-    let before = crate::decode_with_budget(&winner.data, analysis.memory_budget_bytes)?;
-    crate::png_rate::verify_current(&before, &trial.data, analysis.memory_budget_bytes)?;
+    if verify_decode {
+        let before = crate::decode_with_budget(&winner.data, analysis.memory_budget_bytes)?;
+        crate::png_rate::verify_current(&before, &trial.data, analysis.memory_budget_bytes)?;
+    }
+    let policy = match level {
+        10 => "libdeflate10_v1",
+        _ => "libdeflate12_v1",
+    };
     candidates.push(Candidate {
         id: format!("{}-deflate-packed", winner.id),
         parameters: Parameters::PngDeflatePacked {
-            policy: "libdeflate12_v1",
+            policy,
             zlib_bytes: trial.zlib_bytes,
         },
         bytes: trial.data.len(),

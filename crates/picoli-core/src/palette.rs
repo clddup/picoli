@@ -25,6 +25,10 @@ pub(crate) struct Histogram {
 }
 
 impl Histogram {
+    pub(crate) fn bin_count(&self) -> usize {
+        self.bins.len()
+    }
+
     pub(crate) fn new(reference: &Reference, analysis: &Analysis) -> Self {
         let mut buckets = vec![[0u64; 4]; 32768];
         let mut seen = Vec::new();
@@ -973,13 +977,11 @@ fn encode_data_with(
         indexed,
     };
     let mut selected = [true; 5];
-    let use_preview = height >= 192
-        && data.len() >= 65536
-        && (color_type == png::ColorType::Rgb || (fast && data.len() >= 262_144));
+    let use_preview = height >= 192 && data.len() >= 65536;
     if use_preview {
         // Rank filters on first/middle/last row strips. Fast search uses level 1;
-        // final level-9 keeps level-9 on the 48-row preview to preserve filter ranking.
-        let preview_level = if fast { 1 } else { 9 };
+        // final candidate generation uses level 4 (followed by libdeflate packing).
+        let preview_level = if fast { 1 } else { 4 };
         let stride = data.len() / height as usize;
         let mut preview = Vec::with_capacity(stride * 48);
         for start in [0, (height as usize - 16) / 2, height as usize - 16] {
@@ -1000,28 +1002,29 @@ fn encode_data_with(
             selected[index] = if fast {
                 rank == 0
             } else {
-                rank < 2 || bytes <= ranked[0].0 + ranked[0].0 / 100
+                rank == 0 || (rank == 1 && bytes <= ranked[0].0 + ranked[0].0 / 100)
             };
         }
     }
     if fast {
         return best_filtered(data, layout, selected, 1);
     }
-    // For very large non-preview final encodes, rank all 5 filters on level 4
-    // first so level 9 only runs on the top 2 (+2% ties).
-    if !use_preview && data.len() >= 512 * 1024 {
+    // Final candidate packing uses libdeflate, so intermediate candidate encoding
+    // only needs a fast filter-accurate deflate level.
+    let level = if data.len() >= 256 * 1024 { 4 } else { 6 };
+    if !use_preview && data.len() >= 128 * 1024 {
         let mut ranked = Vec::with_capacity(FILTERS.len());
         for (index, &(filter, _)) in FILTERS.iter().enumerate() {
-            let bytes = encode_with_filter(data, layout, filter, 4)?;
+            let bytes = encode_with_filter(data, layout, filter, 1)?;
             ranked.push((bytes.len(), index));
         }
         ranked.sort_unstable();
         selected.fill(false);
         for (rank, &(bytes, index)) in ranked.iter().enumerate() {
-            selected[index] = rank < 2 || bytes <= ranked[0].0 + ranked[0].0 / 50;
+            selected[index] = rank == 0 || (rank == 1 && bytes <= ranked[0].0 + ranked[0].0 / 50);
         }
     }
-    best_filtered(data, layout, selected, 9)
+    best_filtered(data, layout, selected, level)
 }
 
 #[cfg(test)]

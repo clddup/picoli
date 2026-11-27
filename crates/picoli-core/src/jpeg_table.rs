@@ -122,6 +122,29 @@ pub(crate) fn refine(
     Ok(())
 }
 
+pub(crate) fn refine_fast(
+    source: &[u8],
+    reference: &Reference,
+    analysis: &Analysis,
+    candidates: &mut Vec<Candidate>,
+    strength: Strength,
+) -> Result<(), Error> {
+    let pixels = u64::from(reference.pixels.width()) * u64::from(reference.pixels.height());
+    let evaluate_single = pixels < 1_000_000;
+    if refine_original_with(
+        source,
+        reference,
+        analysis,
+        candidates,
+        strength,
+        evaluate_single,
+    )? && pixels < 1_000_000
+    {
+        repair::refine(source, reference, analysis, candidates, strength)?;
+    }
+    Ok(())
+}
+
 fn repair_opportunity(rejected_bytes: Option<usize>, post_v81_best_bytes: usize) -> bool {
     rejected_bytes.is_some_and(|n| n < post_v81_best_bytes)
 }
@@ -134,6 +157,17 @@ fn refine_original(
     analysis: &Analysis,
     candidates: &mut Vec<Candidate>,
     strength: Strength,
+) -> Result<bool, Error> {
+    refine_original_with(source, reference, analysis, candidates, strength, true)
+}
+
+fn refine_original_with(
+    source: &[u8],
+    reference: &Reference,
+    analysis: &Analysis,
+    candidates: &mut Vec<Candidate>,
+    strength: Strength,
+    evaluate_single: bool,
 ) -> Result<bool, Error> {
     if strength.percent() == 0 || reference.source_format != "jpeg" || reference.alpha.is_some() {
         return Ok(false);
@@ -177,17 +211,19 @@ fn refine_original(
         sampling,
         admission.coefficients,
     )?;
-    let identity =
-        coefficient_io::serialize_bounded(reference, &frame, coding, admission.output_limit)?
-            .ok_or(Error::Encoding(
+    #[cfg(debug_assertions)]
+    {
+        let identity =
+            coefficient_io::serialize_bounded(reference, &frame, coding, admission.output_limit)?
+                .ok_or(Error::Encoding(
                 "global quantizer OFF exceeded current full file".into(),
             ))?;
-    if identity != current.data {
-        return Err(Error::Encoding(
-            "global quantizer OFF does not reproduce current full file".into(),
-        ));
+        if identity != current.data {
+            return Err(Error::Encoding(
+                "global quantizer OFF does not reproduce current full file".into(),
+            ));
+        }
     }
-    drop(identity);
     let control_score = analysis.score(&pixels)?;
     let model = model::build_bounded(
         reference,
@@ -205,9 +241,13 @@ fn refine_original(
     debug_assert!(model.critical_tile.0 < (reference.pixels.width() as usize).div_ceil(16));
     debug_assert!(model.critical_tile.1 < (reference.pixels.height() as usize).div_ceil(16));
     debug_assert!(model.base_pixel >= 0 && model.base_edge >= 0 && model.base_tile >= 0);
-    let single = solver::solve(&model.curves, false);
+    let single = if evaluate_single {
+        Some(solver::solve(&model.curves, false))
+    } else {
+        None
+    };
     let paired = solver::solve(&model.curves, true);
-    for solution in [&single, &paired] {
+    for solution in single.iter().chain(std::iter::once(&paired)) {
         if solution.total.pixel > 0
             || solution.total.edge > 0
             || solution.total.tile > 0
@@ -218,15 +258,19 @@ fn refine_original(
             ));
         }
     }
-    let plain = encode_solution_from_frame(
-        reference,
-        analysis,
-        frame.clone(),
-        &model,
-        &single,
-        &admission,
-        coding,
-    )?;
+    let plain = if let Some(single_sol) = &single {
+        encode_solution_from_frame(
+            reference,
+            analysis,
+            frame.clone(),
+            &model,
+            single_sol,
+            &admission,
+            coding,
+        )?
+    } else {
+        None
+    };
     let raw = encode_solution_from_frame(
         reference, analysis, frame, &model, &paired, &admission, coding,
     )?;
@@ -245,11 +289,12 @@ fn refine_original(
     let raw = raw.filter(accepted);
     // Frozen v80 tie order: the single solution wins equal complete lengths,
     // irrespective of score/lambda/model rate or the paired solution's provenance.
+    let single_exchanges = single.as_ref().map_or(0, |s| s.exchanges);
     let (selected, allocation, exchanges) = match (plain, raw) {
         (Some(p), Some(r)) if r.data.len() < p.data.len() => {
             (r, "paired_luma_tables", paired.exchanges)
         }
-        (Some(p), _) => (p, "single_luma_tables", single.exchanges),
+        (Some(p), _) => (p, "single_luma_tables", single_exchanges),
         (None, Some(r)) => (r, "paired_luma_tables", paired.exchanges),
         (None, None) => return Ok(repair_opportunity(rejected_bytes, current.bytes)),
     };
@@ -288,4 +333,15 @@ pub(crate) fn refine_chroma(
     strength: Strength,
 ) -> Result<(), Error> {
     chroma::refine(source, reference, analysis, candidates, strength)
+}
+
+/// Fast single-pass paired chroma refinement for production compression.
+pub(crate) fn refine_chroma_fast(
+    source: &[u8],
+    reference: &Reference,
+    analysis: &Analysis,
+    candidates: &mut Vec<Candidate>,
+    strength: Strength,
+) -> Result<(), Error> {
+    chroma::refine_fast(source, reference, analysis, candidates, strength)
 }

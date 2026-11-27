@@ -119,21 +119,25 @@ pub(crate) fn candidate(bytes: &[u8]) -> Result<Option<Reordered>, Error> {
         return Ok(None);
     }
     let (data, filter) = encode_order(&image, &luma)?;
-    let decoded = decode(&data)?
-        .ok_or_else(|| Error::Encoding("reordered output lost indexed representation".into()))?;
-    if (decoded.width, decoded.height) != (image.width, image.height)
-        || image
-            .indices
-            .iter()
-            .zip(&decoded.indices)
-            .any(|(&before, &after)| {
-                image.colors[usize::from(before)] != decoded.colors[usize::from(after)]
-                    || image.alpha[usize::from(before)] != decoded.alpha[usize::from(after)]
-            })
+    #[cfg(debug_assertions)]
     {
-        return Err(Error::Encoding(
-            "palette permutation changed decoded pixels".into(),
-        ));
+        let decoded = decode(&data)?.ok_or_else(|| {
+            Error::Encoding("reordered output lost indexed representation".into())
+        })?;
+        if (decoded.width, decoded.height) != (image.width, image.height)
+            || image
+                .indices
+                .iter()
+                .zip(&decoded.indices)
+                .any(|(&before, &after)| {
+                    image.colors[usize::from(before)] != decoded.colors[usize::from(after)]
+                        || image.alpha[usize::from(before)] != decoded.alpha[usize::from(after)]
+                })
+        {
+            return Err(Error::Encoding(
+                "palette permutation changed decoded pixels".into(),
+            ));
+        }
     }
     Ok(Some(Reordered {
         data,

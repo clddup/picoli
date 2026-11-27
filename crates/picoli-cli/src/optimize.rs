@@ -68,15 +68,48 @@ pub(super) fn run(args: Args) -> Result<(), Box<dyn Error>> {
         quality::preserve_png_density(&source, &mut candidate)?;
         results.push(candidate);
     }
-    quality::refine_png_candidates(&source, &mut results, strength)?;
-    quality::refine_jpeg_candidates(&reference, &analysis, &mut results, strength)?;
-    quality::refine_jpeg_eob_candidates(&reference, &analysis, &mut results, strength)?;
-    quality::refine_jpeg_scan_huffman_candidates(&reference, &analysis, &mut results, strength)?;
-    quality::refine_jpeg_coefficient_candidates(&reference, &analysis, &mut results, strength)?;
-    quality::refine_jpeg_table_candidates(&source, &reference, &analysis, &mut results, strength)?;
-    quality::refine_jpeg_chroma_candidates(&source, &reference, &analysis, &mut results, strength)?;
-    quality::refine_png_rate_candidates(&source, &reference, &analysis, &mut results, strength)?;
-    quality::refine_png_deflate_candidates(&source, &reference, &analysis, &mut results, strength)?;
+    let pixels = u64::from(reference.pixels.width()) * u64::from(reference.pixels.height());
+    if reference.source_format == "jpeg" {
+        quality::refine_jpeg_scan_huffman_candidates(
+            &reference,
+            &analysis,
+            &mut results,
+            strength,
+        )?;
+        quality::refine_jpeg_table_fast(&source, &reference, &analysis, &mut results, strength)?;
+        let winner_sampling =
+            quality::best(results.iter(), strength).and_then(|c| match &c.parameters {
+                optimize::Parameters::Jpeg { sampling, .. } => Some(*sampling),
+                optimize::Parameters::JpegTableAllocated { control, .. } => {
+                    match control.as_ref() {
+                        optimize::Parameters::Jpeg { sampling, .. } => Some(*sampling),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            });
+        if winner_sampling != Some(420) && pixels <= 2_500_000 {
+            quality::refine_jpeg_chroma_fast(
+                &source,
+                &reference,
+                &analysis,
+                &mut results,
+                strength,
+            )?;
+        }
+    } else {
+        quality::refine_png_candidates(&source, &mut results, strength)?;
+        if pixels <= 300_000 {
+            quality::refine_png_rate_candidates(
+                &source,
+                &reference,
+                &analysis,
+                &mut results,
+                strength,
+            )?;
+        }
+        quality::refine_png_deflate_fast(&source, &reference, &analysis, &mut results, strength)?;
+    }
     let extension = if reference.source_format == "jpeg" {
         "jpg"
     } else {

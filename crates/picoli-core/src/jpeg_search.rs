@@ -83,9 +83,8 @@ pub(crate) fn run_bounded(
     Ok(Some(result))
 }
 
-/// Binary-search quality admission without running full entropy serialization on
-/// `scale = 1` or intermediate binary-search probes; serialize only accepted
-/// scales in the final `(boundary - 4)..=(boundary + 4)` neighborhood.
+/// Exponential bracket + binary-search quality admission without running full
+/// entropy serialization on intermediate probes; serialize only the boundary.
 pub(crate) fn run_prepared<S>(
     state: &mut S,
     strength: Strength,
@@ -98,42 +97,34 @@ pub(crate) fn run_prepared<S>(
     let Some(finest_score) = score_only(state, 1)? else {
         return Ok(None);
     };
-    let mut probed: Vec<(u16, Option<crate::analysis::Score>)> = vec![(1, Some(finest_score))];
-    let (mut low, mut high, mut boundary) = (1i32, 5000i32, 1i32);
+    let mut best_scale = 1u16;
+    let mut best_score = finest_score;
+
+    // Bracket the acceptance boundary exponentially so typical scales (10..150)
+    // converge in ~7 probes instead of ~14.
+    let mut low = 1i32;
+    let mut high = 5000i32;
+    for probe in [16i32, 32, 64, 128, 256, 512, 1024, 2500, 5000] {
+        if let Some(score) = score_only(state, probe as u16)? {
+            best_scale = probe as u16;
+            best_score = score;
+            low = probe + 1;
+        } else {
+            high = probe - 1;
+            break;
+        }
+    }
+
     while low <= high {
         let scale = (low + high) / 2;
-        let accepted = if let Some((_, old)) = probed.iter().find(|(s, _)| *s == scale as u16) {
-            old.is_some()
-        } else {
-            let score = score_only(state, scale as u16)?;
-            let accepted = score.is_some();
-            probed.push((scale as u16, score));
-            accepted
-        };
-        if accepted {
-            boundary = scale;
+        if let Some(score) = score_only(state, scale as u16)? {
+            best_scale = scale as u16;
+            best_score = score;
             low = scale + 1;
         } else {
             high = scale - 1;
         }
     }
-    let mut result: Option<Candidate> = None;
-    for scale in (boundary - 4).max(1)..=(boundary + 4).min(5000) {
-        let scale = scale as u16;
-        let score = if let Some((_, old)) = probed.iter().find(|(s, _)| *s == scale) {
-            old.clone()
-        } else {
-            score_only(state, scale)?
-        };
-        if let Some(score) = score {
-            let candidate = encode_accepted(state, scale, score)?;
-            if result
-                .as_ref()
-                .is_none_or(|old| (candidate.bytes, &candidate.id) < (old.bytes, &old.id))
-            {
-                result = Some(candidate);
-            }
-        }
-    }
-    Ok(result)
+
+    Ok(Some(encode_accepted(state, best_scale, best_score)?))
 }

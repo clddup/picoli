@@ -179,6 +179,28 @@ pub(super) fn refine(
     cs: &mut Vec<Candidate>,
     strength: Strength,
 ) -> Result<(), Error> {
+    refine_impl(source, r, a, cs, strength, &[false, true], true)
+}
+
+pub(super) fn refine_fast(
+    source: &[u8],
+    r: &Reference,
+    a: &Analysis,
+    cs: &mut Vec<Candidate>,
+    strength: Strength,
+) -> Result<(), Error> {
+    refine_impl(source, r, a, cs, strength, &[true], cfg!(debug_assertions))
+}
+
+fn refine_impl(
+    source: &[u8],
+    r: &Reference,
+    a: &Analysis,
+    cs: &mut Vec<Candidate>,
+    strength: Strength,
+    modes: &[bool],
+    verify_decode: bool,
+) -> Result<(), Error> {
     if strength.percent() == 0 || r.source_format != "jpeg" || r.alpha.is_some() {
         return Ok(());
     }
@@ -200,9 +222,18 @@ pub(super) fn refine(
         return Ok(());
     };
     let mut best = None;
-    for paired in [false, true] {
+    for &paired in modes {
         if let Some(alt) = pass_with_identity(
-            r, a, current, sampling, coding, &admit, strength, paired, !paired,
+            r,
+            a,
+            current,
+            sampling,
+            coding,
+            &admit,
+            strength,
+            paired,
+            verify_decode && !paired,
+            verify_decode,
         )? && alt.data.len() < current.bytes
             && nonworse(&alt.score, &current.score, strength)
             && best
@@ -247,7 +278,7 @@ fn pass(
     paired: bool,
 ) -> Result<Option<Alternative>, Error> {
     pass_with_identity(
-        reference, a, current, sampling, coding, admit, strength, paired, true,
+        reference, a, current, sampling, coding, admit, strength, paired, true, true,
     )
 }
 
@@ -262,6 +293,7 @@ fn pass_with_identity(
     strength: Strength,
     paired: bool,
     verify_identity: bool,
+    verify_decode: bool,
 ) -> Result<Option<Alternative>, Error> {
     let Captured { mut frame, pixels } =
         coefficient_io::capture_generated(&current.data, reference, sampling, admit.coefficients)?;
@@ -436,18 +468,23 @@ fn pass_with_identity(
     let data = coefficient_io::serialize_bounded(reference, &frame, coding, admit.output_limit)?;
     drop(frame);
     let Some(data) = data else { return Ok(None) };
-    let decoded = crate::decode_with_budget(&data, a.memory_budget_bytes)?;
-    if decoded.pixels.dimensions() != reference.pixels.dimensions()
-        || decoded.alpha != reference.alpha
-    {
-        return Err(Error::Encoding("chroma changed geometry/Alpha".into()));
-    }
-    let score = a.score(&decoded.pixels)?;
-    if decoded.pixels != *state.pixels() || !same(&score, &state.score()) {
-        return Err(Error::Encoding(
-            "chroma final full decode RGB/score differs from incremental state".into(),
-        ));
-    }
+    let score = if verify_decode {
+        let decoded = crate::decode_with_budget(&data, a.memory_budget_bytes)?;
+        if decoded.pixels.dimensions() != reference.pixels.dimensions()
+            || decoded.alpha != reference.alpha
+        {
+            return Err(Error::Encoding("chroma changed geometry/Alpha".into()));
+        }
+        let score = a.score(&decoded.pixels)?;
+        if decoded.pixels != *state.pixels() || !same(&score, &state.score()) {
+            return Err(Error::Encoding(
+                "chroma final full decode RGB/score differs from incremental state".into(),
+            ));
+        }
+        score
+    } else {
+        state.score()
+    };
     if !nonworse(&score, bounds, strength) {
         return Err(Error::Encoding(
             "chroma escaped original component/strength limits".into(),

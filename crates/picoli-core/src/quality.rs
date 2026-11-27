@@ -126,9 +126,20 @@ pub fn run_job(
         }
         Job::Png { colors } => {
             let hist = palette::Histogram::new(reference, analysis);
-            run_png_palette_job(reference, analysis, &hist, colors, limits, None)
+            Ok(
+                match run_png_palette_job(reference, analysis, &hist, colors, limits, None)? {
+                    PaletteOutcome::Candidate(c) => Some(c),
+                    PaletteOutcome::RejectedQuality | PaletteOutcome::PrunedSize => None,
+                },
+            )
         }
     }
+}
+
+enum PaletteOutcome {
+    Candidate(Candidate),
+    RejectedQuality,
+    PrunedSize,
 }
 
 fn run_png_palette_job(
@@ -138,7 +149,7 @@ fn run_png_palette_job(
     colors: usize,
     limits: Limits,
     best_png_bytes: Option<usize>,
-) -> Result<Option<Candidate>, Error> {
+) -> Result<PaletteOutcome, Error> {
     if !(2..=256).contains(&colors) {
         return Err(Error::Argument("palette size must be 2..=256"));
     }
@@ -160,21 +171,10 @@ fn run_png_palette_job(
         reconstructed: Option<image::RgbImage>,
         score: Score,
     }
-    let mut top_trials: Vec<FastTrial> = Vec::with_capacity(3);
-    for exact in [false, true] {
-        // Keep the original mapping candidates as controls. The exact
-        // mode targets dense palettes, where two guesses can miss.
-        if exact && palette.len() < 64 {
-            continue;
-        }
-        let mut mapper = palette::Mapper::with_histogram(reference, hist, &palette, exact);
-        let mut zero_nearest: Option<Vec<u8>> = None;
-        let coherences: &[u32] = if palette.len() <= 1 {
-            &[0]
-        } else {
-            &[0, 64, 256, 1024, 2048, 4096, 8192]
-        };
-        for &coherence in coherences {
+    let exact = palette.len() >= 64;
+    let mut mapper = palette::Mapper::with_histogram(reference, hist, &palette, exact);
+    let mut eval_coherence =
+        |coherence: u32, zero_nearest: &mut Option<Vec<u8>>| -> Result<Option<FastTrial>, Error> {
             let (indices, reconstructed, score) = if let Some(context) = &opaque {
                 let nearest_ref = if exact && coherence > 0 {
                     zero_nearest.as_deref()
@@ -184,16 +184,16 @@ fn run_png_palette_job(
                 let Some((indices, score)) =
                     mapper.map_scored_indices(reference, analysis, coherence, nearest_ref, context)
                 else {
-                    continue;
+                    return Ok(None);
                 };
                 if exact && coherence == 0 {
-                    zero_nearest = Some(indices.clone());
+                    *zero_nearest = Some(indices.clone());
                 }
                 (indices, None, score)
             } else {
                 let (indices, reconstructed) = mapper.map(reference, analysis, coherence);
                 let Some(score) = analysis.score_with_limits(&reconstructed, limits)? else {
-                    continue;
+                    return Ok(None);
                 };
                 (indices, Some(reconstructed), score)
             };
@@ -219,7 +219,7 @@ fn run_png_palette_job(
             } else {
                 format!("png-{colors}-coherence-{coherence}")
             };
-            top_trials.push(FastTrial {
+            Ok(Some(FastTrial {
                 fast_bytes,
                 id,
                 coherence,
@@ -227,71 +227,70 @@ fn run_png_palette_job(
                 indices,
                 reconstructed,
                 score,
-            });
-            top_trials.sort_by(|a, b| (a.fast_bytes, &a.id).cmp(&(b.fast_bytes, &b.id)));
-            top_trials.truncate(2);
+            }))
+        };
+
+    let mut zero_nearest: Option<Vec<u8>> = None;
+    let Some(base_trial) = eval_coherence(0, &mut zero_nearest)? else {
+        return Ok(PaletteOutcome::RejectedQuality);
+    };
+    let mut best_trial = base_trial;
+    if palette.len() > 1 {
+        // Higher coherence monotonically shrinks PNG size while increasing color
+        // error, so binary-search the largest accepted coherence (2-3 probes).
+        const GRID: [u32; 6] = [64, 256, 1024, 2048, 4096, 8192];
+        let mut low = 0usize;
+        let mut high = GRID.len();
+        while low < high {
+            let mid = (low + high) / 2;
+            if let Some(trial) = eval_coherence(GRID[mid], &mut zero_nearest)? {
+                if (trial.fast_bytes, &trial.id) < (best_trial.fast_bytes, &best_trial.id) {
+                    best_trial = trial;
+                }
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
         }
     }
-    if top_trials.is_empty() {
-        return Ok(None);
-    }
+    let trial = best_trial;
     if let Some(best_known) = best_png_bytes {
-        let top_fast = if use_strip {
-            palette::encode_for_reference_with(
-                reference,
-                &top_trials[0].indices,
-                &palette,
-                top_trials[0].reconstructed.as_ref(),
-                true,
-            )?
-            .0
-            .len()
+        let estimated_fast = if use_strip {
+            trial
+                .fast_bytes
+                .saturating_mul(reference.pixels.height() as usize)
+                .div_ceil(128)
         } else {
-            top_trials[0].fast_bytes
+            trial.fast_bytes
         };
-        if top_fast > best_known.saturating_mul(2) {
-            return Ok(None);
+        if estimated_fast > best_known.saturating_mul(2) {
+            return Ok(PaletteOutcome::PrunedSize);
         }
     }
-    let best_fast = top_trials[0].fast_bytes;
-    let threshold = best_fast + best_fast / 50; // within 2% of fast winner
-    let mut result: Option<Candidate> = None;
-    for (rank, trial) in top_trials.into_iter().enumerate() {
-        if rank > 0 && trial.fast_bytes > threshold {
-            break;
-        }
-        let (data, filter) = palette::encode_for_reference_with(
-            reference,
-            &trial.indices,
-            &palette,
-            trial.reconstructed.as_ref(),
-            false,
-        )?;
-        let c = Candidate {
-            id: trial.id,
-            parameters: Parameters::Png {
-                colors: palette.len(),
-                coherence: trial.coherence,
-                filter,
-                mapping: if trial.exact {
-                    "exact_cell_bounds"
-                } else {
-                    "cell_two_nearest"
-                },
-                palette_order: "as_generated",
+    let (data, filter) = palette::encode_for_reference_with(
+        reference,
+        &trial.indices,
+        &palette,
+        trial.reconstructed.as_ref(),
+        false,
+    )?;
+    Ok(PaletteOutcome::Candidate(Candidate {
+        id: trial.id,
+        parameters: Parameters::Png {
+            colors: palette.len(),
+            coherence: trial.coherence,
+            filter,
+            mapping: if trial.exact {
+                "exact_cell_bounds"
+            } else {
+                "cell_two_nearest"
             },
-            bytes: data.len(),
-            data,
-            score: trial.score,
-        };
-        if result
-            .as_ref()
-            .is_none_or(|old| (c.bytes, &c.id) < (old.bytes, &old.id))
-        {
-            result = Some(c);
-        }
-    }
-    Ok(result)
+            palette_order: "as_generated",
+        },
+        bytes: data.len(),
+        data,
+        score: trial.score,
+    }))
 }
 
 /// Reorder only the winning filtered indexed PNG, retaining its exact pixels.
@@ -506,6 +505,7 @@ pub fn refine_jpeg_scan_huffman_candidates(
     };
     let mut smallest = winner.bytes;
     let mut refined = None;
+    #[cfg(debug_assertions)]
     let mut before = None;
     for scans in [2, 4] {
         let data = crate::jpeg::encode_entropy(
@@ -520,20 +520,23 @@ pub fn refine_jpeg_scan_huffman_candidates(
         if data.len() >= smallest {
             continue;
         }
-        if before.is_none() {
-            before = Some(crate::decode_with_budget(
-                &winner.data,
-                analysis.memory_budget_bytes,
-            )?);
-        }
-        let old = before
-            .as_ref()
-            .ok_or(Error::Encoding("missing JPEG entropy control".into()))?;
-        let decoded = crate::decode_with_budget(&data, analysis.memory_budget_bytes)?;
-        if old.pixels != decoded.pixels || old.alpha != decoded.alpha {
-            return Err(Error::Encoding(
-                "JPEG per-scan Huffman coding changed decoded pixels".into(),
-            ));
+        #[cfg(debug_assertions)]
+        {
+            if before.is_none() {
+                before = Some(crate::decode_with_budget(
+                    &winner.data,
+                    analysis.memory_budget_bytes,
+                )?);
+            }
+            let old = before
+                .as_ref()
+                .ok_or(Error::Encoding("missing JPEG entropy control".into()))?;
+            let decoded = crate::decode_with_budget(&data, analysis.memory_budget_bytes)?;
+            if old.pixels != decoded.pixels || old.alpha != decoded.alpha {
+                return Err(Error::Encoding(
+                    "JPEG per-scan Huffman coding changed decoded pixels".into(),
+                ));
+            }
         }
         smallest = data.len();
         refined = Some(Candidate {
@@ -588,6 +591,17 @@ pub fn refine_jpeg_table_candidates(
     crate::jpeg_table::refine(source, reference, analysis, candidates, strength)
 }
 
+/// Fast table allocation pass for production compression.
+pub fn refine_jpeg_table_fast(
+    source: &[u8],
+    reference: &Reference,
+    analysis: &Analysis,
+    candidates: &mut Vec<Candidate>,
+    strength: Strength,
+) -> Result<(), Error> {
+    crate::jpeg_table::refine_fast(source, reference, analysis, candidates, strength)
+}
+
 /// Independently budgeted chroma pass after the complete unchanged table prefix.
 pub fn refine_jpeg_chroma_candidates(
     source: &[u8],
@@ -597,6 +611,17 @@ pub fn refine_jpeg_chroma_candidates(
     strength: Strength,
 ) -> Result<(), Error> {
     crate::jpeg_table::refine_chroma(source, reference, analysis, candidates, strength)
+}
+
+/// Fast single-pass paired chroma refinement for production compression.
+pub fn refine_jpeg_chroma_fast(
+    source: &[u8],
+    reference: &Reference,
+    analysis: &Analysis,
+    candidates: &mut Vec<Candidate>,
+    strength: Strength,
+) -> Result<(), Error> {
+    crate::jpeg_table::refine_chroma_fast(source, reference, analysis, candidates, strength)
 }
 
 /// One budget-admitted, exact-pixel PNG rate-filter finisher. No quality budget
@@ -623,6 +648,17 @@ pub fn refine_png_deflate_candidates(
     crate::png_deflate::refine(source, reference, analysis, candidates, strength)
 }
 
+/// Fast adaptive libdeflate PNG recompression (level 7 for large images, level 9 otherwise).
+pub fn refine_png_deflate_fast(
+    source: &[u8],
+    reference: &Reference,
+    analysis: &Analysis,
+    candidates: &mut Vec<Candidate>,
+    strength: Strength,
+) -> Result<(), Error> {
+    crate::png_deflate::refine_fast(source, reference, analysis, candidates, strength)
+}
+
 /// Preserve input format and fall back to the original rather than lower quality
 /// bounds or return a larger file. Strength 0 is a byte-identical pass-through.
 pub fn compress(source: &[u8], strength: Strength) -> Result<Candidate, Error> {
@@ -636,16 +672,27 @@ pub fn compress_with_budget(
 ) -> Result<Candidate, Error> {
     let reference = crate::decode_with_budget(source, memory_budget_bytes)?;
     let analysis = Analysis::for_reference(&reference, memory_budget_bytes)?;
+    let pixels = u64::from(reference.pixels.width()) * u64::from(reference.pixels.height());
     let mut candidates = vec![original(&reference, &analysis, source)?];
     if strength.percent() > 0 {
         if reference.source_format == "jpeg" {
             let limits = strength.limits();
-            for sampling in [444u16, 422, 420] {
+            // Probe 420 first: when 420 passes with comfortable quantization headroom
+            // (scale >= 25), wider chroma samplings are much larger and skipped.
+            // If 420 passes only at tiny scale (chroma-sensitive edges), skip 422 and
+            // also check 444 so quality-constrained photos keep optimal compression.
+            let mut skip_422 = false;
+            for sampling in [420u16, 422, 444] {
+                if sampling == 422 && skip_422 {
+                    continue;
+                }
                 let mut prepared = jpeg::PreparedSampling::new(&reference, sampling)?;
+                let mut max_scale = 0u16;
+                let mut sampling_accepted = false;
                 for shape in [
-                    crate::optimize::Shape::Standard,
                     crate::optimize::Shape::Detail,
                     crate::optimize::Shape::Spectrum,
+                    crate::optimize::Shape::Standard,
                 ] {
                     if let Some(c) = crate::jpeg_search::run_prepared(
                         &mut prepared,
@@ -657,33 +704,62 @@ pub fn compress_with_budget(
                             jpeg::encode_prepared(p, &reference, &analysis, shape, scale, score)
                         },
                     )? {
+                        sampling_accepted = true;
+                        if let Parameters::Jpeg {
+                            quantization_scale, ..
+                        } = c.parameters
+                        {
+                            max_scale = max_scale.max(quantization_scale);
+                        }
                         candidates.push(c);
                     }
+                }
+                if sampling == 420 && sampling_accepted {
+                    if max_scale >= 25 {
+                        break;
+                    }
+                    skip_422 = true;
+                } else if sampling == 422 && sampling_accepted && max_scale >= 25 {
+                    break;
                 }
             }
         } else {
             let limits = strength.limits();
             let hist = palette::Histogram::new(&reference, &analysis);
-            let mut best_png_bytes = Some(source.len());
-            if let Some(mut c) = run_job(&reference, &analysis, Job::PngLossless, strength)? {
-                preserve_png_density(source, &mut c)?;
-                best_png_bytes = best_png_bytes.map(|b| b.min(c.bytes));
-                candidates.push(c);
-            }
-            for job in crate::optimize::jobs(reference.source_format)? {
-                if let Job::Png { colors } = job
-                    && let Some(mut c) = run_png_palette_job(
-                        &reference,
-                        &analysis,
-                        &hist,
-                        colors,
-                        limits,
-                        best_png_bytes,
-                    )?
-                {
-                    preserve_png_density(source, &mut c)?;
-                    best_png_bytes = best_png_bytes.map(|b| b.min(c.bytes));
-                    candidates.push(c);
+            // Track only the best generated lossy PNG (encoded at the same fast/mid
+            // level) so a tightly pre-compressed source PNG does not prune level-1
+            // predictive probes before final libdeflate packing.
+            let mut best_png_bytes: Option<usize> = None;
+            let mut covered_all_bins = false;
+            let palette_sizes: &[usize] = if pixels >= 2_000_000 {
+                &[256, 128, 64, 32, 16, 12, 8, 4]
+            } else {
+                &[256, 128, 64, 32, 16, 12, 8, 6, 5, 4]
+            };
+            // Probe palettes largest-to-smallest so once a palette size cannot
+            // meet quality limits, smaller palettes are pruned immediately.
+            for &colors in palette_sizes {
+                if colors > hist.bin_count() && covered_all_bins {
+                    continue;
+                }
+                if colors >= hist.bin_count() {
+                    covered_all_bins = true;
+                }
+                match run_png_palette_job(
+                    &reference,
+                    &analysis,
+                    &hist,
+                    colors,
+                    limits,
+                    best_png_bytes,
+                )? {
+                    PaletteOutcome::Candidate(mut c) => {
+                        preserve_png_density(source, &mut c)?;
+                        best_png_bytes = Some(best_png_bytes.map_or(c.bytes, |b| b.min(c.bytes)));
+                        candidates.push(c);
+                    }
+                    PaletteOutcome::PrunedSize => {}
+                    PaletteOutcome::RejectedQuality => break,
                 }
             }
             if let Some(mut c) = predictive::search_bounded_with_target(
@@ -693,19 +769,42 @@ pub fn compress_with_budget(
                 best_png_bytes,
             )? {
                 preserve_png_density(source, &mut c)?;
+                best_png_bytes = Some(best_png_bytes.map_or(c.bytes, |b| b.min(c.bytes)));
+                candidates.push(c);
+            }
+            // Defer full lossless re-encode unless the image is small, low-color,
+            // or lossy candidates did not beat the input file.
+            if (pixels <= 262_144
+                || hist.bin_count() <= 256
+                || best_png_bytes.is_none_or(|b| b >= source.len()))
+                && let Some(mut c) = run_job(&reference, &analysis, Job::PngLossless, strength)?
+            {
+                preserve_png_density(source, &mut c)?;
                 candidates.push(c);
             }
         }
     }
-    refine_png_candidates(source, &mut candidates, strength)?;
-    refine_jpeg_candidates(&reference, &analysis, &mut candidates, strength)?;
-    refine_jpeg_eob_candidates(&reference, &analysis, &mut candidates, strength)?;
-    refine_jpeg_scan_huffman_candidates(&reference, &analysis, &mut candidates, strength)?;
-    refine_jpeg_coefficient_candidates(&reference, &analysis, &mut candidates, strength)?;
-    refine_jpeg_table_candidates(source, &reference, &analysis, &mut candidates, strength)?;
-    refine_jpeg_chroma_candidates(source, &reference, &analysis, &mut candidates, strength)?;
-    refine_png_rate_candidates(source, &reference, &analysis, &mut candidates, strength)?;
-    refine_png_deflate_candidates(source, &reference, &analysis, &mut candidates, strength)?;
+    if reference.source_format == "jpeg" {
+        refine_jpeg_scan_huffman_candidates(&reference, &analysis, &mut candidates, strength)?;
+        refine_jpeg_table_fast(source, &reference, &analysis, &mut candidates, strength)?;
+        let winner_sampling = best(candidates.iter(), strength).and_then(|c| match &c.parameters {
+            Parameters::Jpeg { sampling, .. } => Some(*sampling),
+            Parameters::JpegTableAllocated { control, .. } => match control.as_ref() {
+                Parameters::Jpeg { sampling, .. } => Some(*sampling),
+                _ => None,
+            },
+            _ => None,
+        });
+        if winner_sampling != Some(420) && pixels <= 2_500_000 {
+            refine_jpeg_chroma_fast(source, &reference, &analysis, &mut candidates, strength)?;
+        }
+    } else {
+        refine_png_candidates(source, &mut candidates, strength)?;
+        if pixels <= 300_000 {
+            refine_png_rate_candidates(source, &reference, &analysis, &mut candidates, strength)?;
+        }
+        refine_png_deflate_fast(source, &reference, &analysis, &mut candidates, strength)?;
+    }
     let winner = best(candidates.iter(), strength)
         .ok_or(Error::Encoding("no quality-safe candidate".into()))?;
     let index = candidates

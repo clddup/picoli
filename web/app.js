@@ -50,6 +50,7 @@ function iconButton(label, symbol, action) {
 }
 
 function render() {
+  document.body.dataset.processing = String(running);
   $('file-count').textContent = String(items.length);
   $('empty-queue').hidden = items.length !== 0;
   $('clear').disabled = items.length === 0;
@@ -121,7 +122,8 @@ function render() {
 function renderPreview() {
   const item = items.find(value => value.id === selectedId);
   const visible = Boolean(item?.sourceUrl && !item.previewFailed);
-  $('preview-empty').querySelector('h3').textContent = item?.previewFailed ? '这张图片无法预览。' : '小一点，也要看仔细。';
+  $('preview-empty').querySelector('h3').textContent = item?.previewFailed ? '这张图片无法预览。' : '图像对比视窗';
+  $('preview-state').textContent = item?.previewFailed ? 'PREVIEW UNAVAILABLE' : 'AWAITING INPUT';
   $('preview-empty').querySelector('p').textContent = item?.previewFailed
     ? item.error ? readableError(item.error) : '文件可能损坏，仍可尝试压缩。'
     : '选中队列里的图片，在这里对比原图与压缩结果。';
@@ -164,6 +166,7 @@ function updateSplit() {
   const value = Number($('compare').value);
   $('result-image').style.clipPath = `inset(0 ${100 - value}% 0 0)`;
   $('split-line').style.left = `${value}%`;
+  $('compare').style.setProperty('--fill', `${value}%`);
 }
 
 async function addFiles(files) {
@@ -256,8 +259,23 @@ $('clear').addEventListener('click', () => {
   ++runToken; ++ingestionToken; stopRequested = true; currentAbort?.abort(); currentAbort = null; running = false;
   items.forEach(release); items.length = 0; selectedId = null; zoomed = false; render();
 });
-$('strength').addEventListener('input', () => { $('strength-value').value = $('strength').value; });
-$('reset-strength').addEventListener('click', () => { $('strength').value = '50'; $('strength-value').value = '50'; });
+function syncStrength() {
+  $('strength-value').value = $('strength').value;
+  $('strength').style.setProperty('--fill', `${$('strength').value}%`);
+}
+$('strength').addEventListener('input', syncStrength);
+$('reset-strength').addEventListener('click', () => { $('strength').value = '50'; syncStrength(); });
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+$('drop-zone').addEventListener('pointermove', event => {
+  if (reducedMotion.matches) return;
+  const bounds = $('drop-zone').getBoundingClientRect();
+  $('drop-zone').style.setProperty('--pointer-x', `${event.clientX - bounds.left}px`);
+  $('drop-zone').style.setProperty('--pointer-y', `${event.clientY - bounds.top}px`);
+});
+$('drop-zone').addEventListener('pointerleave', () => {
+  $('drop-zone').style.removeProperty('--pointer-x');
+  $('drop-zone').style.removeProperty('--pointer-y');
+});
 $('compare').addEventListener('input', updateSplit);
 let draggingComparison = false;
 function dragComparison(event) {

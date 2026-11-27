@@ -3,48 +3,69 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#f5f5f0">
+  <meta name="theme-color" content="#080c15">
   <meta name="description" content="Picoli 图片压缩工作台。JPG、PNG 在浏览器本地处理，保留格式、尺寸与透明度。">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
-  <title>Picoli · 图片轻一点</title>
+  <title>Picoli · 本地图像压缩终端</title>
   <link rel="icon" href="./favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="./styles.css">
   <script type="module" src="./app.js"></script>
 </head>
 <body>
+  <div class="ambient-grid" aria-hidden="true"></div>
   <header class="site-header">
-    <a class="brand" href="./" aria-label="Picoli 首页"><img src="./favicon.svg" width="34" height="34" alt=""><span>picoli<span class="brand-dot">.</span></span></a>
-    <nav aria-label="主导航"><span class="nav-current">图片工作台</span><a href="https://github.com/clddup/picoli" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a></nav>
+    <a class="brand" href="./" aria-label="Picoli 首页"><img src="./favicon.svg" width="36" height="36" alt=""><span>PICOLI<span class="brand-dot">_</span></span></a>
+    <nav aria-label="主导航"><span class="nav-current"><span class="nav-dot"></span>图片工作台</span><a href="https://github.com/clddup/picoli" target="_blank" rel="noopener noreferrer">SOURCE CODE <span aria-hidden="true">↗</span></a></nav>
   </header>
   <main>
     <section class="intro" aria-labelledby="headline">
-      <div><p class="eyebrow">SMALLER FILES. SAME CANVAS.</p><h1 id="headline">让图片<span>轻一点。</span></h1><p class="intro-copy">放下图片，带走更轻的版本。格式、尺寸和透明度，留在原处。</p></div>
-      <div class="local-badge"><span class="status-dot"></span><div><strong>图片不离开你的设备</strong><span>Rust + WebAssembly · 本地处理</span></div></div>
+      <div class="intro-text">
+        <p class="eyebrow"><span></span>CLIENT-SIDE IMAGE ENGINE</p>
+        <h1 id="headline">压缩体积。<span>释放空间。</span></h1>
+        <p class="intro-copy">让每一张图片，轻装上阵。<br>原格式、原尺寸，直接在你的浏览器中处理。</p>
+        <div class="intro-tags"><span>RUST CORE</span><span>WEBASSEMBLY</span><span>NO UPLOAD</span></div>
+      </div>
+      <div class="engine-module">
+        <div class="core-visual" aria-hidden="true">
+          <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
+          <span class="circuit circuit-one"></span><span class="circuit circuit-two"></span>
+          <div class="core-chip"><span class="chip-mark">P</span><span>WASM</span></div>
+          <span class="core-caption">LOCAL EXECUTION</span>
+        </div>
+        <div class="local-badge"><span class="status-dot"></span><span>图片不离开你的设备</span><span class="local-lock" aria-hidden="true">⌁</span></div>
+      </div>
     </section>
 
+    <div class="workspace-bar"><span><i></i>WORKSPACE <b>/ 图片处理终端</b></span><span class="supported-formats">JPG<span>+</span>PNG</span></div>
     <div class="workspace">
       <section class="queue-panel panel" aria-labelledby="queue-heading">
-        <div class="panel-heading"><div class="heading-label"><h2 id="queue-heading">压缩队列</h2><span id="file-count" class="count">0</span></div><button id="clear" class="text-button" disabled>清空</button></div>
+        <div class="panel-heading"><div class="heading-label"><span class="panel-number">01</span><h2 id="queue-heading">图片队列</h2><span id="file-count" class="count">0</span></div><button id="clear" class="text-button" disabled>清空</button></div>
         <input id="file-input" type="file" accept="image/jpeg,image/png,.jpg,.jpeg,.png" multiple hidden>
         <button id="drop-zone" class="drop-zone" type="button">
-          <span class="upload-icon" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><rect x="5" y="7" width="22" height="20" rx="4"></rect><path d="m9 22 5-5 4 4 3-3 6 6M16 3v10m-4-6 4-4 4 4"></path></svg></span>
-          <strong>把图片拖到这里，或<span class="choose-link">选择图片</span></strong>
-          <span class="drop-note">JPG / PNG · 支持批量选择 · 单张最大 32 MiB</span>
+          <span class="drop-reticle" aria-hidden="true"></span>
+          <span class="upload-icon" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><rect x="5" y="7" width="22" height="20" rx="2"></rect><path d="m9 22 5-5 4 4 3-3 6 6M16 3v10m-4-6 4-4 4 4"></path></svg></span>
+          <strong>拖入图片，或<span class="choose-link">选择文件 <span aria-hidden="true">↗</span></span></strong>
+          <span class="drop-note">JPG / PNG · 批量处理 · 单张最大 32 MiB</span>
+          <span class="drop-caption" aria-hidden="true">DROP FILES TO INITIALIZE</span>
         </button>
         <div class="settings">
-          <div class="setting-label"><label for="strength">压缩强度</label><output id="strength-value" for="strength">50</output></div>
+          <div class="setting-label"><label for="strength">压缩强度 <span>STRENGTH</span></label><output id="strength-value" for="strength">50</output></div>
           <input id="strength" class="strength-range" type="range" min="0" max="100" value="50" step="1" aria-describedby="strength-hint">
           <div class="strength-labels"><span>更少改动</span><button id="reset-strength" class="text-button" type="button">默认 50</button><span>更小体积</span></div>
           <p id="strength-hint" class="setting-hint">数值越高，允许的失真越大。它不是画质保留百分比。</p>
         </div>
         <div id="file-list" class="file-list" aria-label="图片队列"></div>
-        <div id="empty-queue" class="empty-queue"><span class="empty-rule"></span><p>还没有图片。先放一张试试。</p><span class="empty-rule"></span></div>
+        <div id="empty-queue" class="empty-queue"><span class="terminal-prompt" aria-hidden="true">›</span><p>等待添加图片<span class="terminal-cursor" aria-hidden="true">_</span></p><span class="empty-line" aria-hidden="true"></span></div>
         <div class="queue-actions"><div id="queue-summary" class="queue-summary" role="status" aria-live="polite">准备好，就开始。</div><div class="action-buttons"><button id="download-all" class="button button-secondary" disabled>下载 ZIP</button><button id="start" class="button button-primary" disabled>开始压缩 <span aria-hidden="true">↗</span></button></div></div>
       </section>
 
       <aside class="preview-panel panel" aria-labelledby="preview-heading">
-        <div class="panel-heading"><h2 id="preview-heading">看清每个细节</h2><span id="preview-format" class="format-tag">预览</span></div>
-        <div id="preview-empty" class="preview-empty"><div class="empty-frames" aria-hidden="true"><span></span><span><svg viewBox="0 0 64 64" fill="none"><path d="M13 45 27 30l10 10 7-8 10 13"></path><circle cx="43" cy="20" r="5"></circle></svg></span></div><h3>小一点，也要看仔细。</h3><p>选中队列里的图片，在这里<br>对比原图与压缩结果。</p></div>
+        <div class="panel-heading"><div class="heading-label"><span class="panel-number">02</span><h2 id="preview-heading">画质对比</h2></div><span id="preview-format" class="format-tag">预览</span></div>
+        <div id="preview-empty" class="preview-empty">
+          <div class="viewfinder" aria-hidden="true"><div class="viewfinder-grid"></div><span class="target-corner top-left"></span><span class="target-corner top-right"></span><span class="target-corner bottom-left"></span><span class="target-corner bottom-right"></span><div class="target-image"><svg viewBox="0 0 64 64" fill="none"><rect x="10" y="12" width="44" height="40" rx="2"></rect><path d="m11 44 15-15 12 12 7-8 9 11"></path><circle cx="43" cy="23" r="4"></circle></svg></div><span class="crosshair-x"></span><span class="crosshair-y"></span></div>
+          <span id="preview-state" class="preview-state">AWAITING INPUT</span>
+          <h3>图像对比视窗</h3><p>选中队列里的图片，在这里对比原图与压缩结果。</p>
+        </div>
         <div id="preview-content" hidden>
           <div class="preview-toolbar"><span id="preview-name"></span><button id="zoom" class="small-button" type="button" aria-pressed="false">适应窗口</button></div>
           <div id="preview-scroller" class="preview-scroller checkerboard"><div id="comparison" class="comparison"><img id="original-image" alt="原图"><img id="result-image" class="result-image" alt="压缩结果" hidden><div id="split-line" class="split-line" hidden><span aria-hidden="true">↔</span></div></div></div>
@@ -52,13 +73,13 @@
           <div class="preview-options"><div class="background-picker" role="group" aria-label="透明图片预览背景"><button class="background-swatch swatch-checker" data-background="checkerboard" aria-label="棋盘格背景" aria-pressed="true"></button><button class="background-swatch swatch-light" data-background="light" aria-label="白色背景" aria-pressed="false"></button><button class="background-swatch swatch-dark" data-background="dark" aria-label="深色背景" aria-pressed="false"></button></div><span id="preview-dimensions"></span></div>
           <div id="result-info" class="result-info"><span>压缩后可拖动分界，查看差异。</span></div>
         </div>
-        <div class="preview-footnote"><span aria-hidden="true">↳</span> 保持原格式、原尺寸；透明 PNG 保留 Alpha。</div>
+        <div class="preview-footnote"><span aria-hidden="true">⌗</span> 保持原格式、原尺寸；透明 PNG 保留 Alpha。</div>
       </aside>
     </div>
-    <section class="bottom-notes" aria-label="使用说明"><p><span class="note-number">01</span>选择图片，调整强度</p><p><span class="note-number">02</span>本地处理，查看差异</p><p><span class="note-number">03</span>下载结果，原图不变</p></section>
+    <section class="bottom-notes" aria-label="使用说明"><p><span class="note-number">01</span>选择图片<span class="note-en">INPUT</span></p><span class="flow-line" aria-hidden="true"></span><p><span class="note-number">02</span>本地压缩<span class="note-en">PROCESS</span></p><span class="flow-line" aria-hidden="true"></span><p><span class="note-number">03</span>对比下载<span class="note-en">EXPORT</span></p></section>
     <p class="development-note">开发预览版。压缩可能改变颜色和细节；不支持的图片会说明原因，无法进一步减小时保留原文件。</p>
   </main>
-  <footer><span>Picoli · 少一点体积，多一点空间。</span><div><a id="version-link" href="https://github.com/clddup/picoli" target="_blank" rel="noopener noreferrer">开发版本</a><span class="footer-separator">/</span><a href="./LICENSE">GPL-3.0</a><a href="./THIRD-PARTY-NOTICES.md">第三方来源</a><a href="./third-party-licenses.txt">许可全文</a></div></footer>
+  <footer><span class="footer-brand">PICOLI <span>/ LOCAL IMAGE COMPRESSION</span></span><div><a id="version-link" href="https://github.com/clddup/picoli" target="_blank" rel="noopener noreferrer">开发版本</a><span class="footer-separator">/</span><a href="./LICENSE">GPL-3.0</a><a href="./THIRD-PARTY-NOTICES.md">第三方来源</a><a href="./third-party-licenses.txt">许可全文</a></div></footer>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <noscript>Picoli 需要启用 JavaScript 和 WebAssembly 才能在浏览器中压缩图片。</noscript>
 </body>

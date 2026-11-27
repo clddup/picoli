@@ -1,6 +1,7 @@
 /** Run the shared Rust compressor off the main thread, with real cancellation. */
-export function compressFile(file, strength, { signal, onPhase = () => {}, workerFactory = () => new Worker(new URL('./compress-worker.js', import.meta.url), { type: 'module' }), timeout = 180000 } = {}) {
+export function compressFile(file, strength, { signal, memoryMiB = 128, onPhase = () => {}, workerFactory = () => new Worker(new URL('./compress-worker.js', import.meta.url), { type: 'module' }), timeout = 180000 } = {}) {
   if (signal?.aborted) return Promise.reject(new DOMException('已停止压缩。', 'AbortError'));
+  if (!Number.isInteger(memoryMiB) || memoryMiB < 16 || memoryMiB > 1024) return Promise.reject(new Error('内存预算必须是 16–1024 MiB 的整数。'));
   return new Promise((resolve, reject) => {
     let worker;
     let settled = false;
@@ -37,7 +38,7 @@ export function compressFile(file, strength, { signal, onPhase = () => {}, worke
         }
       };
       file.arrayBuffer().then(input => {
-        if (!settled) worker.postMessage({ type: 'compress', input, strength }, [input]);
+        if (!settled) worker.postMessage({ type: 'compress', input, strength, memoryMiB }, [input]);
       }).catch(error => finish(error));
     } catch (error) {
       finish(error);

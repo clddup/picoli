@@ -20,8 +20,26 @@ test('returns actual output and terminates the worker', async () => {
   const result = await compressFile(file, 50, { workerFactory: () => worker, onPhase: phase => phases.push(phase) });
   assert.equal(result.buffer.byteLength, 2);
   assert.equal(worker.request.strength, 50);
+  assert.equal(worker.request.memoryMiB, 128);
   assert.deepEqual(phases, ['compressing']);
   assert.equal(worker.stopped, true);
+});
+
+test('explicit budgets reach the worker without changing strength', async () => {
+  for (const memoryMiB of [16, 256, 512, 1024]) {
+    const worker = new WorkerHarness();
+    worker.respond = () => worker.onmessage({ data: { type: 'result', buffer: new Uint8Array([1]).buffer, milliseconds: 1 } });
+    await compressFile(file, 50, { memoryMiB, workerFactory: () => worker });
+    assert.equal(worker.request.memoryMiB, memoryMiB);
+    assert.equal(worker.request.strength, 50);
+    assert.equal(worker.stopped, true);
+  }
+});
+
+test('invalid budgets are rejected before creating a worker', async () => {
+  for (const memoryMiB of [0, 15, 1025, 128.5, '1024', NaN]) {
+    await assert.rejects(compressFile(file, 50, { memoryMiB, workerFactory() { throw new Error('must not create'); } }), /内存预算/);
+  }
 });
 
 test('stop aborts a running worker; late messages cannot succeed', async () => {

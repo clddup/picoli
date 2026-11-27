@@ -56,6 +56,7 @@ function render() {
   $('clear').disabled = items.length === 0;
   $('clear').textContent = running ? '停止并清空' : '清空';
   $('strength').disabled = running;
+  $('memory').disabled = running;
   $('reset-strength').disabled = running;
   $('start').disabled = !items.some(item => item.format) || packaging;
   $('start').textContent = running ? '停止处理' : items.some(item => item.status === 'done') ? '重新压缩 ↗' : '开始压缩 ↗';
@@ -207,7 +208,8 @@ async function addFiles(files) {
 async function start() {
   if (running) { stopRequested = true; currentAbort?.abort(); return; }
   const strength = Number($('strength').value);
-  let pending = items.filter(item => item.format && (item.status !== 'done' || item.usedStrength !== strength));
+  const memoryMiB = Number($('memory').value);
+  let pending = items.filter(item => item.format && (item.status !== 'done' || item.usedStrength !== strength || item.usedMemoryMiB !== memoryMiB));
   if (!pending.length) pending = items.filter(item => item.format);
   if (!pending.length) return;
   const token = ++runToken;
@@ -223,13 +225,13 @@ async function start() {
       currentAbort = new AbortController(); render();
       try {
         const result = await compressFile(item.file, strength, {
-          signal: currentAbort.signal,
+          signal: currentAbort.signal, memoryMiB,
           onPhase: phase => { if (token === runToken && items.includes(item)) { item.phase = phase; render(); } },
         });
         if (token !== runToken || !items.includes(item)) break;
         item.blob = new Blob([result.buffer], { type: item.mime });
         item.resultUrl = URL.createObjectURL(item.blob);
-        item.milliseconds = result.milliseconds; item.usedStrength = strength;
+        item.milliseconds = result.milliseconds; item.usedStrength = strength; item.usedMemoryMiB = memoryMiB;
         item.status = 'done';
       } catch (error) {
         if (token !== runToken || !items.includes(item)) break;
@@ -264,6 +266,13 @@ function syncStrength() {
   $('strength').style.setProperty('--fill', `${$('strength').value}%`);
 }
 $('strength').addEventListener('input', syncStrength);
+$('memory').addEventListener('change', () => {
+  const high = Number($('memory').value) >= 512;
+  $('memory-hint').classList.toggle('warning', high);
+  $('memory-hint').textContent = high
+    ? '高预算会增加内存占用，手机或内存不足的设备慎用。预算不是进程内存的硬上限。'
+    : '这是工作集估算预算，不是浏览器进程内存的硬上限。';
+});
 $('reset-strength').addEventListener('click', () => { $('strength').value = '50'; syncStrength(); });
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 $('drop-zone').addEventListener('pointermove', event => {

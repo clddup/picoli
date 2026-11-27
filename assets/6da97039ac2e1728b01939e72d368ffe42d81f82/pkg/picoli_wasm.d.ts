@@ -7,12 +7,13 @@ export function baseline_encode(input: Uint8Array, format: string, quality: numb
 
 /**
  * Optional compression strength percentage; input format and dimensions stay unchanged.
+ * When `memory_mib` is omitted, the working-set budget adapts automatically to the image.
  * Proxy error limits are experimental and do not prove perceptual equivalence.
  */
 export function compress_experimental(input: Uint8Array, strength_percent?: number | null, memory_mib?: number | null): Uint8Array;
 
 /**
- * Header-only one-worker budget estimate, capped at 1024 MiB; not free RAM/RSS.
+ * Header-only adaptive one-worker working-set estimate; not free RAM/RSS.
  * The returned JSON has width, height, format, required_memory_bytes and memory_mib.
  * Actual compression still validates the complete image.
  */

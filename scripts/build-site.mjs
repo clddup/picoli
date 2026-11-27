@@ -59,7 +59,7 @@ try {
     '--filter-platform', 'wasm32-unknown-unknown',
   ], { cwd: root, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'inherit'] }));
 } catch (cause) {
-  throw new Error('Cannot collect WASM dependency licenses offline. Build the locked WASM package first to populate the Cargo cache.', { cause });
+  throw new Error('Cannot collect WASM dependency licenses offline. Run cargo fetch --locked to cache all workspace dependency manifests first.', { cause });
 }
 const packages = new Map(metadata.packages.map((pkg) => [pkg.id, pkg]));
 const nodes = new Map(metadata.resolve.nodes.map((node) => [node.id, node]));
@@ -124,16 +124,33 @@ const gitSha = process.env.GITHUB_SHA || git('rev-parse', 'HEAD');
 const repositoryUrl = process.env.GITHUB_REPOSITORY
   ? `${process.env.GITHUB_SERVER_URL || 'https://github.com'}/${process.env.GITHUB_REPOSITORY}`
   : git('remote', 'get-url', 'origin').replace(/^git@github\.com:/, 'https://github.com/').replace(/\.git$/, '');
+if (!/^[a-f0-9]{40}$/i.test(gitSha)) throw new Error('Expected a full Git commit SHA for versioned assets.');
 const version = { gitSha, buildTimestamp: new Date().toISOString(), repositoryUrl };
+// A new page must never pair cached JavaScript with another commit's WASM.
+const assetDirectory = `assets/${gitSha}`;
 
 await rm(dist, { recursive: true, force: true });
 await mkdir(dist, { recursive: true });
 for (const [source, destination] of files) {
-  const output = join(dist, destination);
+  const target = source.startsWith('web/') && destination !== 'index.html'
+    ? join(assetDirectory, destination) : destination;
+  const output = join(dist, target);
   await mkdir(dirname(output), { recursive: true });
-  await copyFile(join(root, source), output);
+  if (destination === 'index.html') {
+    let html = await readFile(join(root, source), 'utf8');
+    for (const asset of ['styles.css', 'app.js', 'favicon.svg']) {
+      const relativeUrl = `./${asset}`;
+      if (!html.includes(`\"${relativeUrl}\"`)) throw new Error(`Missing HTML asset reference: ${asset}`);
+      html = html.replaceAll(`\"${relativeUrl}\"`, `\"./${assetDirectory}/${asset}\"`);
+    }
+    await writeFile(output, html);
+  } else {
+    await copyFile(join(root, source), output);
+  }
 }
-await writeFile(join(dist, 'version.json'), `${JSON.stringify(version, null, 2)}\n`);
+for (const destination of ['version.json', `${assetDirectory}/version.json`]) {
+  await writeFile(join(dist, destination), `${JSON.stringify(version, null, 2)}\n`);
+}
 await writeFile(join(dist, 'third-party-licenses.txt'), thirdPartyLicenses);
 await writeFile(join(dist, '.nojekyll'), '');
 console.log(`Built ${files.length} site files and notices for ${thirdPartyPackages.length} third-party packages in ${dist} (${gitSha}).`);

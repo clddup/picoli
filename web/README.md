@@ -7,6 +7,7 @@ Picoli 通过 WebAssembly 在本地处理图片。构建步骤见项目 [README]
 先按项目 README 构建 WASM 和绑定，然后在仓库根目录执行：
 
 ```sh
+cargo fetch --locked
 node scripts/build-site.mjs
 python3 -I -m http.server 8080 --bind 127.0.0.1 --directory dist
 ```

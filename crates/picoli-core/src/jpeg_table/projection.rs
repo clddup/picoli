@@ -104,8 +104,9 @@ pub fn build_bounded(
             let i = y * frame.width + x;
             let w = analysis.weights[i];
             let p = current.get_pixel(x as u32, y as u32).0;
-            (a[t], b[t]) = factors(analysis.colors[i], p, w);
-            let error = i128::from(w) * i128::from(distance(analysis.colors[i], color(p))) * Q * Q;
+            (a[t], b[t]) = factors(analysis.colors.at(i), p, w);
+            let error =
+                i128::from(w) * i128::from(distance(analysis.colors.at(i), color(p))) * Q * Q;
             base_pixel += error;
             if critical {
                 base_tile += error;

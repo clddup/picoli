@@ -233,7 +233,7 @@ impl<'a> State<'a> {
             for x in left..right {
                 let i = y * stride + x;
                 let error = u64::from(self.analysis.weights[i])
-                    * distance(self.analysis.colors[i], self.current_color(i));
+                    * distance(self.analysis.colors.at(i), self.current_color(i));
                 adjust(&mut self.pixel_error, error, add);
                 adjust(&mut self.tiles[y / 16 * tile_width + x / 16].0, error, add);
             }
@@ -269,7 +269,7 @@ impl<'a> State<'a> {
     }
 
     fn edge(&self, i: usize, previous: usize) -> u64 {
-        let delta = (self.analysis.colors[i][0] - self.analysis.colors[previous][0])
+        let delta = (self.analysis.colors.at(i)[0] - self.analysis.colors.at(previous)[0])
             - (self.current_color(i)[0] - self.current_color(previous)[0]);
         u64::from(self.analysis.weights[i]) * (i64::from(delta) * i64::from(delta)) as u64
     }

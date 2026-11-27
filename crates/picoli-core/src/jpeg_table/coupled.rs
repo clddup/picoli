@@ -172,7 +172,7 @@ impl<'a> State<'a> {
             .try_reserve_exact(n)
             .map_err(|_| Error::Limit("coupled factors allocation failed"))?;
         for (i, p) in current.pixels().enumerate() {
-            let (a, b) = projection::factors(analysis.colors[i], p.0, analysis.weights[i]);
+            let (a, b) = projection::factors(analysis.colors.at(i), p.0, analysis.weights[i]);
             factors.push([
                 i32::try_from(a).map_err(|_| Error::Limit("coupled quadratic factor overflow"))?,
                 i32::try_from(b).map_err(|_| Error::Limit("coupled linear factor overflow"))?,

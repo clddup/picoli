@@ -147,6 +147,8 @@ fn preflight_model(
         .checked_add(reference.pixels.as_raw().capacity() as u64)?
         .checked_add(reference.jpeg_metadata.capacity() as u64)?
         .checked_add(analysis.weights.capacity() as u64)?
+        // Retain the pre-compaction 12B/pixel reserve: storage changes alone
+        // must not enable extra optional searches at an unchanged host budget.
         .checked_add(
             (analysis.colors.capacity() as u64).checked_mul(size_of::<[i32; 3]>() as u64)?,
         )?

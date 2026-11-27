@@ -135,6 +135,8 @@ fn admission(
         .checked_add(r.pixels.as_raw().capacity() as u64)?
         .checked_add(r.jpeg_metadata.capacity() as u64)?
         .checked_add(a.weights.capacity() as u64)?
+        // Keep the old color reserve so compaction does not change which
+        // optional refinements are admitted at the same budget.
         .checked_add((a.colors.capacity() as u64).checked_mul(12)?)?
         .checked_add(retained)?
         .checked_add(

@@ -39,7 +39,7 @@ impl Analysis {
             for (x, previous) in previous_row.iter_mut().enumerate() {
                 let i = y * w + x;
                 let a = i32::from(alpha.as_raw()[i]);
-                let reference = self.colors[i];
+                let reference = self.colors.at(i);
                 let c = color(candidate.get_pixel(x as u32, y as u32).0);
                 // Chroma composition is background-independent in the frozen
                 // integer proxy. Preserve signed division toward zero exactly.

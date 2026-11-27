@@ -279,7 +279,7 @@ impl<'a> Mapper<'a> {
             let weight = u64::from(analysis.weights[i]);
             let mut mask = self.masks[key(pixel.0)];
             if !self.nearest_cache.is_empty() {
-                let index = self.nearest(pixel.0, analysis.colors[i], mask);
+                let index = self.nearest(pixel.0, analysis.colors.at(i), mask);
                 mask = [0; 4];
                 mask[usize::from(index) / 64] = 1 << (index % 64);
             }
@@ -296,7 +296,7 @@ impl<'a> Mapper<'a> {
                     let index = (word * 64 + bit) as u8;
                     bits &= bits - 1;
                     let mut error =
-                        distance(self.values[usize::from(index)], analysis.colors[i]) * weight;
+                        distance(self.values[usize::from(index)], analysis.colors.at(i)) * weight;
                     if let Some(alpha) = &reference.alpha {
                         let a = u64::from(alpha.as_raw()[i]);
                         error = error * a * a / (255 * 255);
@@ -721,7 +721,7 @@ mod mapping_tests {
             for coherence in [0u32, 64, 8192] {
                 let (indices, _) = mapper.map(&reference, &analysis, coherence);
                 let mut expected: Vec<u8> = Vec::new();
-                for (i, &original) in analysis.colors.iter().enumerate() {
+                for (i, original) in analysis.colors.iter().enumerate() {
                     let left = if i % 37 > 0 { expected[i - 1] } else { 0 };
                     let up = if i >= 37 { expected[i - 37] } else { 0 };
                     let chosen = values

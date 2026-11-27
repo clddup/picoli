@@ -77,7 +77,7 @@ pub(super) fn critical(analysis: &Analysis, current: &RgbImage) -> (usize, usize
                 for x in left..(left + 16).min(width) {
                     let i = y as usize * width as usize + x as usize;
                     let w = u64::from(analysis.weights[i]);
-                    error += w * distance(analysis.colors[i], color(current.get_pixel(x, y).0));
+                    error += w * distance(analysis.colors.at(i), color(current.get_pixel(x, y).0));
                     weight += w;
                 }
             }

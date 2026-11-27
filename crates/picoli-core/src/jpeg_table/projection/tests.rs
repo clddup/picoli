@@ -103,7 +103,7 @@ fn spatial_moment_curves_equal_independent_pixel_jacobian_and_complete_ac_bit_or
                     let basis = i128::from(basis_value);
                     let mut local = 0;
                     for (channel, &j) in jac.iter().enumerate() {
-                        let before = i128::from(a.colors[i][channel] - c[channel]) * Q;
+                        let before = i128::from(a.colors.at(i)[channel] - c[channel]) * Q;
                         let after = before - delta * basis * j;
                         local +=
                             (if channel == 0 { 4 } else { 1 }) * (after * after - before * before);

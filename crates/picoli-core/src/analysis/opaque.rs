@@ -63,7 +63,7 @@ impl OpaqueScorer<'_> {
         let height = self.analysis.dimensions.1 as usize;
         let x = index % width;
         let y = index / width;
-        let reference = self.analysis.colors[index];
+        let reference = self.analysis.colors.at(index);
         let weight = u64::from(self.analysis.weights[index]);
         let error = weight * distance(reference, candidate);
         self.pixel_error += error;
@@ -72,12 +72,12 @@ impl OpaqueScorer<'_> {
         tile.0 += error;
         tile.1 += weight;
         if x > 0 {
-            let delta =
-                (reference[0] - self.analysis.colors[index - 1][0]) - (candidate[0] - self.left_y);
+            let delta = (reference[0] - self.analysis.colors.at(index - 1)[0])
+                - (candidate[0] - self.left_y);
             self.edge_error += weight * (i64::from(delta) * i64::from(delta)) as u64;
         }
         if y > 0 {
-            let delta = (reference[0] - self.analysis.colors[index - width][0])
+            let delta = (reference[0] - self.analysis.colors.at(index - width)[0])
                 - (candidate[0] - self.previous_y[x]);
             self.edge_error += weight * (i64::from(delta) * i64::from(delta)) as u64;
         }

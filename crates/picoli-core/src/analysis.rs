@@ -2,6 +2,8 @@
 use crate::{Error, resources};
 use image::RgbImage;
 use serde::Serialize;
+mod colors;
+use colors::ColorBuffer;
 pub(crate) mod opaque;
 #[cfg(test)]
 mod opaque_tests;
@@ -22,7 +24,7 @@ pub(crate) fn distance(a: [i32; 3], b: [i32; 3]) -> u64 {
 #[derive(Debug)]
 pub struct Analysis {
     pub(crate) weights: Vec<u8>,
-    pub(crate) colors: Vec<[i32; 3]>,
+    pub(crate) colors: ColorBuffer,
     pub(crate) frequency_energy: [u64; 64],
     pub(crate) dimensions: (u32, u32),
     pub(crate) memory_budget_bytes: u64,
@@ -48,35 +50,8 @@ impl Analysis {
         resources::Plan::new(w, h, 0, memory_budget_bytes, 1)?;
         let w = w as usize;
         let h = h as usize;
-        let colors: Vec<_> = image.pixels().map(|p| color(p.0)).collect();
-        let mut raw = vec![1u8; colors.len()];
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                let mut activity = 0;
-                for j in [y * w + (x + 1).min(w - 1), (y + 1).min(h - 1) * w + x] {
-                    activity += (colors[i][0] - colors[j][0]).unsigned_abs();
-                    activity += ((colors[i][1] - colors[j][1]).unsigned_abs()
-                        + (colors[i][2] - colors[j][2]).unsigned_abs())
-                        / 4;
-                }
-                raw[i] = 1 + (activity / 24).min(7) as u8;
-            }
-        }
-        let mut weights = raw.clone();
-        for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                for j in [
-                    y * w + x.saturating_sub(1),
-                    y * w + (x + 1).min(w - 1),
-                    y.saturating_sub(1) * w + x,
-                    (y + 1).min(h - 1) * w + x,
-                ] {
-                    weights[i] = weights[i].max(raw[j]);
-                }
-            }
-        }
+        let colors = ColorBuffer::new(image);
+        let weights = content_weights(&colors, w, h);
         let frequency_energy = spectrum(&colors, &weights, w, h);
         Ok(Self {
             weights,
@@ -205,7 +180,7 @@ impl Analysis {
                     i,
                     background,
                 );
-                let reference = self.composite(self.colors[i], i, background);
+                let reference = self.composite(self.colors.at(i), i, background);
                 let weight = u64::from(self.weights[i]);
                 let error = weight * distance(reference, c);
                 pixel_error += error;
@@ -215,13 +190,13 @@ impl Analysis {
                 tile.1 += weight;
                 if x > 0 {
                     let delta = (reference[0]
-                        - self.composite(self.colors[i - 1], i - 1, background)[0])
+                        - self.composite(self.colors.at(i - 1), i - 1, background)[0])
                         - (c[0] - left[0]);
                     edge_error += weight * (i64::from(delta) * i64::from(delta)) as u64;
                 }
                 if y > 0 {
                     let delta = (reference[0]
-                        - self.composite(self.colors[i - w], i - w, background)[0])
+                        - self.composite(self.colors.at(i - w), i - w, background)[0])
                         - (c[0] - previous[0]);
                     edge_error += weight * (i64::from(delta) * i64::from(delta)) as u64;
                 }
@@ -263,6 +238,51 @@ impl Analysis {
     }
 }
 
+// The dilation only needs the raw activity in three rows. Keep the original
+// four-neighbor maximum, without retaining or cloning a whole raw activity map.
+fn content_weights(colors: &ColorBuffer, width: usize, height: usize) -> Vec<u8> {
+    let mut weights = vec![0; colors.len()];
+    let mut previous = vec![0; width];
+    let mut current = vec![0; width];
+    let mut next = vec![0; width];
+    activity_row(colors, width, height, 0, &mut current);
+    previous.copy_from_slice(&current);
+    activity_row(colors, width, height, 1.min(height - 1), &mut next);
+    for y in 0..height {
+        for x in 0..width {
+            weights[y * width + x] = current[x]
+                .max(current[x.saturating_sub(1)])
+                .max(current[(x + 1).min(width - 1)])
+                .max(previous[x])
+                .max(next[x]);
+        }
+        if y + 1 < height {
+            std::mem::swap(&mut previous, &mut current);
+            std::mem::swap(&mut current, &mut next);
+            activity_row(colors, width, height, (y + 2).min(height - 1), &mut next);
+        }
+    }
+    weights
+}
+
+fn activity_row(colors: &ColorBuffer, width: usize, height: usize, y: usize, row: &mut [u8]) {
+    for (x, value) in row.iter_mut().enumerate() {
+        let i = y * width + x;
+        let center = colors.at(i);
+        let mut activity = 0;
+        for j in [
+            y * width + (x + 1).min(width - 1),
+            (y + 1).min(height - 1) * width + x,
+        ] {
+            let other = colors.at(j);
+            activity += (center[0] - other[0]).unsigned_abs();
+            activity +=
+                ((center[1] - other[1]).unsigned_abs() + (center[2] - other[2]).unsigned_abs()) / 4;
+        }
+        *value = 1 + (activity / 24).min(7) as u8;
+    }
+}
+
 // Fixed-point orthogonal cosine basis, scaled by 256; no platform-dependent cos().
 const BASIS: [[i64; 8]; 8] = [
     [181, 181, 181, 181, 181, 181, 181, 181],
@@ -275,7 +295,7 @@ const BASIS: [[i64; 8]; 8] = [
     [50, -142, 213, -251, 251, -213, 142, -50],
 ];
 
-fn spectrum(colors: &[[i32; 3]], weights: &[u8], w: usize, h: usize) -> [u64; 64] {
+fn spectrum(colors: &ColorBuffer, weights: &[u8], w: usize, h: usize) -> [u64; 64] {
     let mut result = [0u64; 64];
     let bw = w.div_ceil(8);
     let bh = h.div_ceil(8);
@@ -292,7 +312,7 @@ fn spectrum(colors: &[[i32; 3]], weights: &[u8], w: usize, h: usize) -> [u64; 64
                 *cell = indices
                     .iter()
                     .zip(basis)
-                    .map(|(&i, &b)| i64::from(colors[i][0] - 128) * b)
+                    .map(|(&i, &b)| i64::from(colors.at(i)[0] - 128) * b)
                     .sum();
             }
         }

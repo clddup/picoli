@@ -164,7 +164,7 @@ input[type=range]::-moz-range-thumb { width: 7px; height: 11px; border-radius: 2
 .button { min-height: 43px; padding: 11px 18px; border-radius: 4px; font-size: 12px; white-space: nowrap; font-weight: 500; transition: background .15s, box-shadow .15s, transform .15s; }
 .button:not(:disabled):active { transform: translateY(1px); }
 .button-primary { min-width: 124px; background: linear-gradient(110deg, #1762e1, #4662ed); color: #fff; border: 1px solid #6c9bf9; box-shadow: 0 0 18px #3565ff25, inset 0 1px #c0dcff30; }
-.button-primary:hover:not(:disabled) { background: linear-gradient(110deg, #2473f4, #6176ff); box-shadow: 0 0 26px #3a82ff40; }
+.button-primary:hover:not(:disabled) { background: linear-gradient(110deg, #1d65dc, #4c60e5); box-shadow: 0 0 26px #3a82ff40; }
 .button-primary:disabled { opacity: 1; background: #1a2b47; border-color: #324966; color: #8d9fba; box-shadow: none; }
 .button-secondary { background: #172439; border: 1px solid #486080; color: #c1d3eb; }
 .button-secondary:hover:not(:disabled) { background: #203958; color: #ddf2ff; }

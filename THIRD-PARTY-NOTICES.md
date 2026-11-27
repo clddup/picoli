@@ -9,7 +9,7 @@ Picoli 的项目代码采用 [GPL-3.0-only](LICENSE)。下列第三方代码保�
 - 上游：[vstroebel/jpeg-encoder](https://github.com/vstroebel/jpeg-encoder)。
 - 本地源码：[vendor/jpeg-encoder](vendor/jpeg-encoder)。
 - 用途：JPEG 编码，包括 DCT、量化、采样和码流生成等上游实现。
-- 本地修改：渐进式 EOBRUN、按扫描统计的 Huffman 表、可选 AC 系数率失真优化、系数访问接口及回归修复。
+- 本地修改：渐进式 EOBRUN、按扫描统计的 Huffman 表、可选 AC 系数率失真优化、系数访问与可复用 FDCT 系数预计算接口及回归修复。
 - 许可证：`(MIT OR Apache-2.0) AND IJG`。MIT 与 Apache-2.0 可二选一，涉及 IJG 的部分还需遵守 IJG 条款。
 - 许可全文：[MIT](vendor/jpeg-encoder/LICENSE-MIT)、[Apache-2.0](vendor/jpeg-encoder/LICENSE-APACHE)、[IJG](vendor/jpeg-encoder/LICENSE-IJG)。
 - 修改说明：[PATCHES.md](vendor/jpeg-encoder/PATCHES.md)。
@@ -21,7 +21,7 @@ Picoli 的项目代码采用 [GPL-3.0-only](LICENSE)。下列第三方代码保�
 - 上游：[etemesi254/zune-image](https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg)。
 - 本地源码：[vendor/zune-jpeg](vendor/zune-jpeg)。
 - 用途：JPEG 解码，包括熵解码、IDCT、重采样和颜色转换等上游实现。
-- 本地修改：截断扫描的严格校验、量化系数访问、亮度及色度块局部重建接口。
+- 本地修改：截断扫描的严格校验、量化系数访问、亮度及色度块局部重建与流式行重建接口。
 - 许可证：`MIT OR Apache-2.0 OR Zlib`，可选择其中一种。
 - 许可全文：[MIT](vendor/zune-jpeg/LICENSE-MIT)、[Apache-2.0](vendor/zune-jpeg/LICENSE-APACHE)、[Zlib](vendor/zune-jpeg/LICENSE-ZLIB)。
 - 修改说明：[PATCHES.md](vendor/zune-jpeg/PATCHES.md)。

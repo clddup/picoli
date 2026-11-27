@@ -11,6 +11,13 @@ export function baseline_encode(input: Uint8Array, format: string, quality: numb
  */
 export function compress_experimental(input: Uint8Array, strength_percent?: number | null, memory_mib?: number | null): Uint8Array;
 
+/**
+ * Header-only one-worker budget estimate, capped at 1024 MiB; not free RAM/RSS.
+ * The returned JSON has width, height, format, required_memory_bytes and memory_mib.
+ * Actual compression still validates the complete image.
+ */
+export function compression_memory_plan(input: Uint8Array): string;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -18,6 +25,7 @@ export interface InitOutput {
     readonly baseline_capabilities: (a: number) => void;
     readonly baseline_encode: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly compress_experimental: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly compression_memory_plan: (a: number, b: number, c: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
     readonly __wbindgen_export: (a: number, b: number, c: number) => void;
     readonly __wbindgen_export2: (a: number, b: number) => number;

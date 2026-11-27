@@ -51,3 +51,7 @@ A shared AC-range iterator now feeds both statistics and serialization. All rang
 The quantization loop iterates over the existing 64-entry zigzag table using `enumerate`. Tests no longer clone `Copy` arrays or add redundant borrows, and one test helper accepts a mutable slice instead of a mutable vector. These changes address Clippy diagnostics without removing assertions or suppressing new warnings.
 
 The separate MozJPEG Rust source investigation was a research comparator. Its crate is not a product dependency, and the local EOBRUN implementation does not claim MozJPEG's trellis functionality.
+
+## Experimental reusable FDCT coefficient preparation
+
+Under the existing `experimental-coefficients` feature, `PreparedFdct` precomputes RGB-to-YCbCr color conversion, chroma subsampling, and integer FDCT blocks once per image and sampling factor, reusing the encoder's existing color conversion and `fdct` routines. `PreparedFdct::quantize_into` writes MCU-aligned zigzagged quantized `i16` coefficients into reusable caller buffers using the encoder's existing quantizer layout, so scale/table search can evaluate and encode multiple quantization tables via `encode_quantized` without repeating color conversion or FDCT on every trial.
